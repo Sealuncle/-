@@ -192,7 +192,7 @@ svg{display:block;max-width:100%}
 <div class="toast" id="toast"></div>
 
 <script>
-const APPS_SCRIPT = "/** 레버리지 2모드 콘솔 — 브리지 v3  (시세 + 데이터 동기화)\n *  1) 시세: GOOGLEFINANCE 이력에서 최근 2개 확정 일별 종가(날짜 포함)\n *  2) 동기화: 앱 데이터를 이 시트의 _sync 탭에 저장/불러오기 (본인 전용 클라우드)\n *\n *  설정: 아래 TOKEN 을 본인만 아는 문자열로 바꾸세요. 앱의 「동기화 암호」와 같아야 합니다.\n *  배포: 배포 > 새 배포 > 웹 앱 / 실행 계정 = 나 / 액세스 권한 = 모든 사용자\n *  ※ 코드 수정 후에는 반드시 「배포 관리 → 새 버전」으로 재배포해야 반영됩니다.\n */\nvar TOKEN = 'CHANGE-ME';          // ★ 반드시 변경\n\nfunction doGet(e) {\n  var p = (e && e.parameter) || {};\n  if (p.action === 'load') return jsonOut(loadState(p), p);\n  if (p.action === 'meta') return jsonOut(meta(p), p);\n  if (p.action === 'ping') return jsonOut({ ok: true, v: 4 }, p);\n  return jsonOut(quotes(p), p);\n}\n\nfunction meta(p) {\n  if (p.token !== TOKEN) return { error: 'bad token' };\n  var sh = SpreadsheetApp.getActive().getSheetByName('_sync');\n  if (!sh || sh.getLastRow() < 1) return { empty: true };\n  return { ok: true, savedAt: String(sh.getRange(1, 2).getValue() || '') };\n}\n\nfunction doPost(e) {\n  var p = (e && e.parameter) || {};\n  if (p.token !== TOKEN) return jsonOut({ error: 'bad token' }, p);\n  var body = (e && e.postData && e.postData.contents) || '';\n  if (!body) return jsonOut({ error: 'empty body' }, p);\n  var sh = sheet('_sync');\n  // 충돌 감지: 클라이언트가 마지막으로 본 저장 시각(ifmatch)과 현재가 다르면\n  // 다른 기기가 그 사이에 저장한 것 → 덮어쓰기 거부 (force=1 이면 강행)\n  var cur = String(sh.getLastRow() >= 1 ? (sh.getRange(1, 2).getValue() || '') : '');\n  if (p.force !== '1' && cur && p.ifmatch !== undefined && p.ifmatch !== cur)\n    return jsonOut({ error: 'conflict', savedAt: cur }, p);\n  sh.clear();\n  var CH = 40000, rows = [];\n  for (var i = 0; i < body.length; i += CH) rows.push([body.slice(i, i + CH)]);\n  sh.getRange(1, 1, rows.length, 1).setValues(rows);\n  sh.getRange(1, 2).setValue(new Date().toISOString());\n  return jsonOut({ ok: true, savedAt: sh.getRange(1, 2).getValue(), bytes: body.length }, p);\n}\n\nfunction loadState(p) {\n  if (p.token !== TOKEN) return { error: 'bad token' };\n  var ss = SpreadsheetApp.getActive(), sh = ss.getSheetByName('_sync');\n  if (!sh || sh.getLastRow() < 1) return { empty: true };\n  var vals = sh.getRange(1, 1, sh.getLastRow(), 1).getValues();\n  var body = vals.map(function (r) { return r[0]; }).join('');\n  return { ok: true, savedAt: String(sh.getRange(1, 2).getValue() || ''), state: body };\n}\n\nfunction quotes(p) {\n  var t = (p.tickers || 'SOXL,TQQQ').split(',')\n          .map(function (s) { return s.trim().toUpperCase(); }).filter(String).slice(0, 20);\n  var sh = sheet('_quote'); sh.clear();\n  sh.getRange('A1').setFormula('=IFERROR(GOOGLEFINANCE(\"CURRENCY:USDKRW\"),\"\")');\n  for (var i = 0; i < t.length; i++)\n    sh.getRange(1, 3 + i * 3)\n      .setFormula('=IFERROR(GOOGLEFINANCE(\"' + t[i] + '\",\"close\",TODAY()-15,TODAY()),\"\")');\n  SpreadsheetApp.flush(); Utilities.sleep(1500); SpreadsheetApp.flush();\n  var tz = 'America/New_York';\n  var out = { fx: Number(sh.getRange('A1').getValue()) || 0,\n              asOf: new Date().toISOString(), src: 'googlefinance-history', prices: {} };\n  for (var i = 0; i < t.length; i++) {\n    var vals = sh.getRange(1, 3 + i * 3, 20, 2).getValues()\n      .filter(function (r) { return r[0] instanceof Date && Number(r[1]) > 0; });\n    if (!vals.length) continue;\n    var last = vals[vals.length - 1], prev = vals.length > 1 ? vals[vals.length - 2] : null;\n    out.prices[t[i]] = {\n      lastClose: Number(last[1]),\n      lastCloseDate: Utilities.formatDate(last[0], tz, 'yyyy-MM-dd'),\n      prevClose: prev ? Number(prev[1]) : 0,\n      prevCloseDate: prev ? Utilities.formatDate(prev[0], tz, 'yyyy-MM-dd') : ''\n    };\n  }\n  return out;\n}\n\nfunction sheet(name) {\n  var ss = SpreadsheetApp.getActive();\n  return ss.getSheetByName(name) || ss.insertSheet(name);\n}\nfunction jsonOut(obj, p) {\n  var json = JSON.stringify(obj);\n  if (p && p.callback)\n    return ContentService.createTextOutput(p.callback + '(' + json + ')')\n           .setMimeType(ContentService.MimeType.JAVASCRIPT);\n  return ContentService.createTextOutput(json)\n         .setMimeType(ContentService.MimeType.JSON);\n}\n";
+const APPS_SCRIPT = "/** 레버리지 2모드 콘솔 — 브리지 v3  (시세 + 데이터 동기화)\n *  1) 시세: GOOGLEFINANCE 이력에서 최근 2개 확정 일별 종가(날짜 포함)\n *  2) 동기화: 앱 데이터를 이 시트의 _sync 탭에 저장/불러오기 (본인 전용 클라우드)\n *\n *  설정: 아래 TOKEN 을 본인만 아는 문자열로 바꾸세요. 앱의 「동기화 암호」와 같아야 합니다.\n *  배포: 배포 > 새 배포 > 웹 앱 / 실행 계정 = 나 / 액세스 권한 = 모든 사용자\n *  ※ 코드 수정 후에는 반드시 「배포 관리 → 새 버전」으로 재배포해야 반영됩니다.\n */\nvar TOKEN = 'CHANGE-ME';          // ★ 반드시 변경\n\nfunction doGet(e) {\n  var p = (e && e.parameter) || {};\n  if (p.action === 'load') return jsonOut(loadState(p), p);\n  if (p.action === 'meta') return jsonOut(meta(p), p);\n  if (p.action === 'ping') return jsonOut({ ok: true, v: 4 }, p);\n  return jsonOut(quotes(p), p);\n}\n\nfunction meta(p) {\n  if (p.token !== TOKEN) return { error: 'bad token' };\n  var sh = SpreadsheetApp.getActive().getSheetByName('_sync');\n  if (!sh || sh.getLastRow() < 1) return { empty: true };\n  return { ok: true, savedAt: String(sh.getRange(1, 2).getValue() || '') };\n}\n\nfunction doPost(e) {\n  var p = (e && e.parameter) || {};\n  if (p.token !== TOKEN) return jsonOut({ error: 'bad token' }, p);\n  var body = (e && e.postData && e.postData.contents) || '';\n  if (!body) return jsonOut({ error: 'empty body' }, p);\n  var sh = sheet('_sync');\n  // 충돌 감지: 클라이언트가 마지막으로 본 저장 시각(ifmatch)과 현재가 다르면\n  // 다른 기기가 그 사이에 저장한 것 → 덮어쓰기 거부 (force=1 이면 강행)\n  var cur = String(sh.getLastRow() >= 1 ? (sh.getRange(1, 2).getValue() || '') : '');\n  if (p.force !== '1' && cur && p.ifmatch !== undefined && p.ifmatch !== cur)\n    return jsonOut({ error: 'conflict', savedAt: cur }, p);\n  sh.clear();\n  var CH = 40000, rows = [];\n  for (var i = 0; i < body.length; i += CH) rows.push([body.slice(i, i + CH)]);\n  sh.getRange(1, 1, rows.length, 1).setValues(rows);\n  sh.getRange(1, 2).setValue(new Date().toISOString());\n  return jsonOut({ ok: true, savedAt: sh.getRange(1, 2).getValue(), bytes: body.length }, p);\n}\n\nfunction loadState(p) {\n  if (p.token !== TOKEN) return { error: 'bad token' };\n  var ss = SpreadsheetApp.getActive(), sh = ss.getSheetByName('_sync');\n  if (!sh || sh.getLastRow() < 1) return { empty: true };\n  var vals = sh.getRange(1, 1, sh.getLastRow(), 1).getValues();\n  var body = vals.map(function (r) { return r[0]; }).join('');\n  return { ok: true, savedAt: String(sh.getRange(1, 2).getValue() || ''), state: body };\n}\n\nfunction quotes(p) {\n  var t = (p.tickers || 'SOXL,TQQQ').split(',')\n          .map(function (s) { return s.trim().toUpperCase(); }).filter(String).slice(0, 20);\n  var sh = sheet('_quote'); sh.clear();\n  sh.getRange('A1').setFormula('=IFERROR(GOOGLEFINANCE(\"CURRENCY:USDKRW\"),\"\")');\n  for (var i = 0; i < t.length; i++)\n    sh.getRange(1, 3 + i * 3)\n      .setFormula('=IFERROR(GOOGLEFINANCE(\"' + t[i] + '\",\"close\",TODAY()-15,TODAY()),\"\")');\n  SpreadsheetApp.flush(); Utilities.sleep(1500); SpreadsheetApp.flush();\n  var tz = 'America/New_York';\n  // 완료된 마지막 세션 계산: ET 16:05 이전이면 당일 세션은 미완료\n  var nowET = new Date(Utilities.formatDate(new Date(), tz, \"yyyy/MM/dd HH:mm:ss\"));\n  var closed = nowET.getHours() > 16 || (nowET.getHours() === 16 && nowET.getMinutes() >= 5);\n  var cut = new Date(nowET.getFullYear(), nowET.getMonth(), nowET.getDate(), 12);\n  if (!closed) cut.setDate(cut.getDate() - 1);\n  while (cut.getDay() === 0 || cut.getDay() === 6) cut.setDate(cut.getDate() - 1);\n  var cutoff = Utilities.formatDate(cut, tz.split('/')[0] === 'America' ? Session.getScriptTimeZone() : tz, 'yyyy-MM-dd');\n  cutoff = cut.getFullYear() + '-' + ('0' + (cut.getMonth() + 1)).slice(-2) + '-' + ('0' + cut.getDate()).slice(-2);\n  var out = { fx: Number(sh.getRange('A1').getValue()) || 0,\n              asOf: new Date().toISOString(), src: 'googlefinance-history',\n              cutoff: cutoff, prices: {} };\n  for (var i = 0; i < t.length; i++) {\n    var vals = sh.getRange(1, 3 + i * 3, 20, 2).getValues()\n      .filter(function (r) { return r[0] instanceof Date && Number(r[1]) > 0; })\n      .filter(function (r) { return Utilities.formatDate(r[0], tz, 'yyyy-MM-dd') <= cutoff; });\n    if (!vals.length) continue;\n    var last = vals[vals.length - 1], prev = vals.length > 1 ? vals[vals.length - 2] : null;\n    out.prices[t[i]] = {\n      lastClose: Number(last[1]),\n      lastCloseDate: Utilities.formatDate(last[0], tz, 'yyyy-MM-dd'),\n      prevClose: prev ? Number(prev[1]) : 0,\n      prevCloseDate: prev ? Utilities.formatDate(prev[0], tz, 'yyyy-MM-dd') : ''\n    };\n  }\n  return out;\n}\n\nfunction sheet(name) {\n  var ss = SpreadsheetApp.getActive();\n  return ss.getSheetByName(name) || ss.insertSheet(name);\n}\nfunction jsonOut(obj, p) {\n  var json = JSON.stringify(obj);\n  if (p && p.callback)\n    return ContentService.createTextOutput(p.callback + '(' + json + ')')\n           .setMimeType(ContentService.MimeType.JAVASCRIPT);\n  return ContentService.createTextOutput(json)\n         .setMimeType(ContentService.MimeType.JSON);\n}\n";
 /* 초기 시드값 없음 — 개인 데이터는 소스에 포함하지 않습니다. 아래 함수로 예시(가짜) 데이터만 넣습니다. */
 const SEED_WEEKLY = [];
 const SEED_SOXL_LOTS = [];
@@ -242,6 +242,34 @@ function networkDays(a,b){
   let n=0; const cur=new Date(s);
   while(cur<=e){ const w=cur.getDay(); if(w!==0&&w!==6) n++; cur.setDate(cur.getDate()+1); }
   return sign*n;
+}
+
+/* ── 미국 거래 세션 시계 ─────────────────────────────────
+   기준 종가 = "완료된 마지막 미국 세션"의 종가.
+   ET 16:05 이전에는 당일 세션이 미완료이므로 전 거래일이 기준. */
+function usEasternNow(){
+  const p=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',
+    year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})
+    .formatToParts(new Date());
+  const g=t=>+p.find(x=>x.type===t).value;
+  return {y:g('year'),m:g('month'),d:g('day'),H:g('hour'),M:g('minute')};
+}
+const fmtD=dt=>dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
+function lastCompletedUsSession(){
+  const n=usEasternNow();
+  const closed=(n.H>16)||(n.H===16&&n.M>=5);        // 16:05 버퍼
+  let dt=new Date(n.y,n.m-1,n.d,12);
+  if(!closed) dt.setDate(dt.getDate()-1);
+  while(dt.getDay()===0||dt.getDay()===6) dt.setDate(dt.getDate()-1);
+  return fmtD(dt);
+}
+function targetUsSession(){                          // 지금 낼 주문이 체결될 세션
+  const n=usEasternNow();
+  const closed=(n.H>16)||(n.H===16&&n.M>=5);
+  let dt=new Date(n.y,n.m-1,n.d,12);
+  if(closed) dt.setDate(dt.getDate()+1);
+  while(dt.getDay()===0||dt.getDay()===6) dt.setDate(dt.getDate()+1);
+  return fmtD(dt);
 }
 
 const fUSD = (v,d=2) => (v<0?'-':'')+'$'+Math.abs(v).toLocaleString('ko-KR',{minimumFractionDigits:d,maximumFractionDigits:d});
@@ -355,12 +383,16 @@ function engine(b){
   // ── 전일 종가(=직전 거래일 종가) 결정 ──────────────────────
   //   기본: ⑥ 일별 매매 기록의 가장 최근 종가 (사용자가 매일 직접 입력하는 값 = 가장 신뢰도 높음)
   //   해제 시: 설정에서 직접 입력한 값
+  E.cutoff = lastCompletedUsSession();               // 완료된 마지막 미국 세션
+  E.session = targetUsSession();                     // 오늘 주문이 체결될 세션
   const recSorted=(b.records||[]).filter(r=>r.d&&num(r.close)>0).sort((x,y)=> x.d<y.d?-1:1);
-  E.lastRec = recSorted.length? recSorted[recSorted.length-1] : null;
+  const eligible=recSorted.filter(r=> r.d<=E.cutoff);          // 미완료 세션 종가는 기준에서 제외
+  E.lastRec = eligible.length? eligible[eligible.length-1] : null;
+  E.futureRec = recSorted.filter(r=> r.d>E.cutoff);            // 장중 가격이 섞여 들어온 기록 (경고용)
   E.prevFromRecord = !!b.prevFromRecord && !!E.lastRec;
   E.prevClose = E.prevFromRecord ? num(E.lastRec.close) : num(b.prevClose);
-  E.prevSrc   = E.prevFromRecord ? ('일별 기록 '+E.lastRec.d) : '직접 입력';
-  E.prevStale = E.prevFromRecord ? Math.max(0, networkDays(D(E.lastRec.d), D(todayISO()))-1) : null;
+  E.prevSrc   = E.prevFromRecord ? (E.lastRec.d+' 종가') : '직접 입력';
+  E.prevStale = E.prevFromRecord ? Math.max(0, networkDays(D(E.lastRec.d), D(E.cutoff))-1) : null;
 
   // ③ 모드
   const am = autoMode(b);
@@ -690,6 +722,8 @@ function renderBook(k){
       <div class="hd">오늘 매수 제안</div>
       <div>${esc(E.buyMsg)}</div>
       <div class="dl" style="margin-top:10px">
+        <dt>대상 세션</dt><dd>${E.session} (미국 기준)</dd>
+        <dt>기준 종가</dt><dd>${E.prevClose? fUSD(E.prevClose):'—'} · ${esc(E.prevSrc)}</dd>
         <dt>매수 지정가</dt><dd>${fUSD(E.buyLimit)}</dd>
         <dt>예상 매수금</dt><dd>${fUSD(E.buyAmt)}</dd>
         <dt>매수 판정</dt><dd>${esc(E.buyVerdict)}</dd>
@@ -720,17 +754,21 @@ function renderBook(k){
       ${fld(k+':seedKRW','최초 투자금 (₩)',b.seedKRW)}
       ${fld(k+':seedUSD','최초 투자금 ($)',b.seedUSD)}
       ${fld(k+':price','현재가 ($)',b.price)}
-      <label class="f"><span class="l">전일 종가 ($) · ${esc(E.prevSrc)}</span>
+      <label class="f"><span class="l">기준 종가 ($) · ${esc(E.prevSrc)} → ${E.session.slice(5)} 세션 주문용</span>
         <input data-b="${k}:prevClose" value="${E.prevFromRecord? E.prevClose : b.prevClose}" ${E.prevFromRecord?'readonly':''}></label>
       <label class="f"><span class="l">총 최초 투자금 ($)</span><input value="${fUSD(E.seedUSD,2)}" readonly></label>
       <label class="f"><span class="l">환율 (₩/$)</span><input data-s="fx" value="${S.fx}"></label>
     </div>
-    <div class="sw" style="margin-top:6px"><div class="t">전일 종가를 일별 기록에서 자동으로 사용
-      <small>⑥ 일별 매매 기록의 가장 최근 종가를 씁니다 — 직접 입력한 값이라 가장 정확합니다</small></div>
+    <div class="sw" style="margin-top:6px"><div class="t">기준 종가를 일별 기록에서 자동으로 사용
+      <small>완료된 마지막 미국 세션(${E.cutoff})의 종가만 기준으로 씁니다 — 장중 가격은 자동 제외</small></div>
       <button class="toggle ${b.prevFromRecord?'on':''}" data-tb="${k}:prevFromRecord"></button></div>
     ${E.prevFromRecord && E.prevStale>=1 ? `<div class="call warn" style="margin-top:10px">
-      <div class="hd">기록이 오래됐습니다</div>마지막 기록이 <b>${E.lastRec.d}</b> 이고 그 뒤로 ${E.prevStale}거래일이 지났습니다.
-      ⑥ 일별 매매 기록에 최신 종가를 추가하세요.</div>` : ''}
+      <div class="hd">기록이 오래됐습니다</div>기준으로 쓸 수 있는 마지막 기록이 <b>${E.lastRec.d}</b> 인데,
+      완료된 마지막 세션은 <b>${E.cutoff}</b> 입니다. ⑥ 일별 기록에 ${E.cutoff} 종가를 추가하거나 시세를 갱신하세요.</div>` : ''}
+    ${E.futureRec.length ? `<div class="call warn" style="margin-top:10px">
+      <div class="hd">장중 가격으로 보이는 기록 제외됨</div>${E.futureRec.map(r=>r.d).join(', ')} 기록은
+      아직 완료되지 않은 세션이라 기준 계산에서 제외했습니다. 장중 시세가 잘못 기록된 것이면 ⑥에서 해당 줄을 삭제하세요.
+      (세션 마감 후에는 자동으로 기준에 포함됩니다)</div>` : ''}
     ${!E.prevFromRecord ? `<div class="note">전일 종가는 LOC 지정가와 익절 판정의 기준값입니다. 위 토글을 켜면 일별 기록에서 자동으로 가져옵니다.</div>` : ''}
     </div>
   </div>
@@ -1144,9 +1182,10 @@ function applyQuote(j,src){
 function autoRecord(k,q){
   const b=S.books[k]; b.records=b.records||[];
   let n=0;
+  const cutoff=lastCompletedUsSession();
   const ensure=(d,c)=>{
     if(!d||!(c>0)||!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
-    if(d>todayISO()) return;                                   // 미래 날짜 방어
+    if(d>cutoff) return;                                       // ★ 미완료 세션(장중 가격) 거부
     if(b.records.some(r=>r.d===d)) return;                     // 이미 있으면 유지
     const lastD=b.records.length? b.records.map(r=>r.d).sort().pop():'';
     if(lastD && d<lastD) return;                               // 과거 역주행 방지
