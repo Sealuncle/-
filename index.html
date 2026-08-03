@@ -245,7 +245,7 @@ svg{display:block;max-width:100%}
   <section class="page" id="p-soxl"></section>
   <section class="page" id="p-tqqq"></section>
   <section class="page" id="p-set"></section>
-  <div class="foot">@patent_leverage &nbsp;·&nbsp; LOC 종가매매 2모드 콘솔</div>
+  <div class="foot">@patent_leverage &nbsp;·&nbsp; LOC 종가매매 2모드 콘솔 &nbsp;·&nbsp; <span id="buildTag"></span></div>
 </main>
 
 <div class="toast" id="toast"></div>
@@ -261,6 +261,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
+const APP_BUILD='v2026.08.03-1';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -1155,7 +1156,7 @@ function bindBook(k){
    ============================================================ */
 function renderSet(){
   $('#p-set').innerHTML=`
-  <div class="eyebrow"><span>Settings · Data &amp; Sync</span><span>${todayISO()}</span></div>
+  <div class="eyebrow"><span>Settings · Data &amp; Sync</span><span>빌드 ${APP_BUILD} · ${todayISO()}</span></div>
   <h1>설정</h1>
   <p class="sub">데이터 저장 위치, 시세 갱신, 백업을 관리합니다.</p>
 
@@ -1562,7 +1563,7 @@ async function fetchPrices(silent){
     if(!silent) toast('시세를 갱신했습니다'+(n?` · 기록 ${n}건 추가`:''));
     fin();
   };
-  let log='';
+  let log=diagLine(true,'앱 버전', APP_BUILD+' — 이 줄이 안 보이면 옛 파일이 캐시된 것입니다');
   const hasGs=!!S.gsUrl, hasTd=!!S.tdKey;
   if(!hasGs && !hasTd){
     log+=diagLine(false,'소스 없음','구글시트 URL 또는 Twelve Data 키 중 하나를 등록하면 정확한 확정 종가를 받습니다. AI 조회로 진행합니다.');
@@ -1705,6 +1706,7 @@ $('#btnSync').onclick=async()=>{
     toast(Store.mode==='cloud'? '클라우드 최신본을 불러왔습니다':'이 브라우저 저장본을 불러왔습니다'); }
   else toast('저장된 데이터가 없습니다'); };
 $('#topDate').textContent=todayISO();
+if($('#buildTag')) $('#buildTag').textContent='빌드 '+APP_BUILD;
 
 async function unlockPrompt(){
   const box=credBox(); if(!box) return;
