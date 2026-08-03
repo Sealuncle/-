@@ -1177,6 +1177,7 @@ function renderSet(){
         <button class="toggle ${S.autoFetch?'on':''}" data-tg2="autoFetch"></button></div>
       <div class="btnrow"><button class="btn" id="fetchPx">지금 갱신</button>
         <button class="btn g" id="openBtn">URL 새 창에서 열기</button>
+        <button class="btn g" id="collectBtn">종목 데이터 수집</button>
         <button class="btn g" id="scriptBtn">Apps Script 코드 보기</button>
         <button class="btn g" id="pasteBtn">수동 붙여넣기</button></div>
       <div id="diag" style="margin-top:10px">${DIAG}</div>
@@ -1331,6 +1332,17 @@ function renderSet(){
     await save(); renderSet();
     pd(diagLine(true,'PIN 설정','완료 — 다음 실행부터 PIN을 묻습니다'));
   };
+  $('#collectBtn').onclick = async()=>{
+    if(!S.gsUrl) return $('#diag').innerHTML=diagLine(false,'수집','웹앱 주소를 먼저 입력하세요');
+    const b=$('#collectBtn'); b.disabled=true; b.textContent='수집 중…';
+    const ids=quoteTickers();
+    $('#diag').innerHTML=diagLine(true,'수집', ids.join(', ')+' 시작 — 종목당 10~30초 걸립니다');
+    const rs=await hubCollectAll(ids, m=>{ $('#diag').innerHTML=diagLine(true,'진행', m); });
+    $('#diag').innerHTML = (rs.done.length? diagLine(true,'수집 완료', rs.done.join(', ')):'')
+      + (rs.fail.length? diagLine(false,'수집 실패', rs.fail.join(' / ')):'');
+    b.disabled=false; b.textContent='종목 데이터 수집';
+    if(rs.done.length) await fetchPrices(true);
+  };
   $('#fetchPx').onclick = ()=> fetchPrices(false);
   const sd=m=>{ const el=$('#syncDiag'); if(el) el.innerHTML=m; };
   $('#pingBtn').onclick = async()=>{
@@ -1401,7 +1413,8 @@ function applyQuote(j,src){
     const vs=j.series.VXN.map(r=>({d:String(r[0]).slice(0,10), c:+r[1]})).filter(x=>x.c>0);
     ['SOXL','TQQQ'].forEach(k=>{ S.books[k].vxnSeries=vs.slice(-400); });
   }
-  if(!Object.keys(QUOTE).length) throw new Error('유효한 시세가 없습니다');
+  if(!Object.keys(QUOTE).length) throw new Error(
+    '시트 아카이브가 비어 있습니다 — 「종목 데이터 수집」을 누르거나, 시트 메뉴 「2모드 콘솔 → 전체 시세 갱신」을 실행하세요');
   S.lastFetch = new Date().toLocaleString('ko-KR',{hour12:false}) + (src? ' · '+src : '');
   S.lastFetchDay = todayISO();
   return autoAdded;
@@ -1502,6 +1515,42 @@ function setSyncDot(ok,msg){
   el.title = msg||'';
 }
 
+/* ── 허브 호출 헬퍼 : 직접 fetch 실패 시 JSONP ── */
+async function hubGet(url){
+  try{
+    const r=await fetch(url,{redirect:'follow'});
+    const t=await r.text();
+    if(/<html/i.test(t)) throw new Error('HTML 반환 — 배포 액세스 권한 「모든 사용자」 확인');
+    return JSON.parse(t);
+  }catch(e){
+    if(e instanceof TypeError || /fetch/i.test(e.message)) return await jsonp(url,15000);
+    throw e;
+  }
+}
+/* ── 최초 수집 : GOOGLEFINANCE 이력을 시트 아카이브에 적재 ──
+   prepare(수식 기록) → collect(값 회수) 를 종목마다 수행. 로딩이 끝날 때까지 폴링. */
+async function hubCollect(id, prog){
+  const p=await hubGet(hubUrl({mode:'prepare', id, ticker:id, years:3}));
+  if(p.ok===false) throw new Error(p.error||'prepare 실패');
+  for(let i=0;i<12;i++){
+    await new Promise(r=>setTimeout(r, i===0?3000:2500));
+    if(prog) prog(`${id} 수집 중… (${i+1}/12)`);
+    const c=await hubGet(hubUrl({mode:'collect', id, n:400}));
+    if(c.done) return {ok:true, rows:c.rows, resolved:c.resolved};
+    if(c.ok===false) return {ok:false, error:c.error||'수집 실패', diag:c.diag||''};
+    if(!c.pending)   return {ok:false, error:'데이터를 받지 못했습니다', diag:c.diag||''};
+  }
+  return {ok:false, error:'시간 초과 — 잠시 후 다시 시도하세요'};
+}
+async function hubCollectAll(ids, prog){
+  const done=[], fail=[];
+  for(const id of ids){
+    try{ const r=await hubCollect(id, prog); r.ok? done.push(id) : fail.push(id+'('+r.error+')'); }
+    catch(e){ fail.push(id+'('+e.message+')'); }
+  }
+  return {done, fail};
+}
+
 async function fetchPrices(silent){
   const btn=$('#fetchPx'), out=$('#diag');
   if(btn){ btn.disabled=true; btn.textContent='조회 중…'; }
@@ -1521,17 +1570,27 @@ async function fetchPrices(silent){
   if(hasGs && !/\/exec(\?|$)/.test(S.gsUrl))
     log+=diagLine(false,'URL 형식','/exec 로 끝나야 합니다. /dev 주소는 본인만 접근됩니다');
 
-  // ① 구글시트 직접
+  // ① 구글시트 허브
   if(hasGs){
     try{
-      const r=await fetch(quoteUrl(),{redirect:'follow'});
-      const txt=await r.text();
-      if(/<html/i.test(txt)) throw new Error('HTML 반환 — 배포 액세스 권한 「모든 사용자」 확인');
-      const n=applyQuote(JSON.parse(txt),'구글시트');
-      return await ok('구글시트','성공 (GOOGLEFINANCE 확정 종가)',n);
+      let j=await hubGet(quoteUrl());
+      if(j.ok===false) throw new Error(j.error);
+      const want=quoteTickers();
+      let missing=want.filter(t=> !(j.prices && j.prices[t]));
+      if(missing.length){
+        log+=diagLine(true,'초기 수집', missing.join(', ')+' — 시트에 종가 이력을 모으는 중입니다 (처음 한 번, 종목당 10~30초)');
+        if(out) out.innerHTML=log;
+        const rs=await hubCollectAll(missing, m=>{ if(out) out.innerHTML=log+diagLine(true,'진행', m); });
+        j=await hubGet(quoteUrl());
+        missing=want.filter(t=> !(j.prices && j.prices[t]));
+        log+=diagLine(rs.fail.length===0, '초기 수집',
+          rs.fail.length? '일부 실패: '+rs.fail.join(' / ') : rs.done.join(', ')+' 완료');
+      }
+      const n=applyQuote(j,'구글시트');
+      return await ok('구글시트','성공 (아카이브 확정 종가)',n);
     }catch(e){
       const cors=e instanceof TypeError||/fetch/i.test(e.message);
-      log+=diagLine(false,'구글시트 직접', cors?'차단됨 (CORS/보안정책)':e.message);
+      log+=diagLine(false,'구글시트', cors?'차단됨 (CORS/보안정책)':e.message);
     }
   }
   // ② Twelve Data (CORS 허용 → 파일/호스팅 환경에서 동작)
