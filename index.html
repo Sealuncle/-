@@ -18,10 +18,48 @@
   --tx:#f2f4f7; --tx2:#9aa1ad; --tx3:#5f6672;
   --red:#e8443a; --amber:#f5a623; --green:#22c55e; --orange:#f2761f; --blue:#3b82f6; --purple:#8b5cf6;
   --ok:#22c55e; --warn:#f5a623; --bad:#e8443a;
+  --shadow:none;
   --r:20px; --r2:14px;
   --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
   --sans:'Pretendard',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
 }
+
+/* ── 라이트 테마 ─────────────────────────────── */
+html[data-theme="light"]{
+  --bg:#f6f7f9; --bg2:#ffffff; --card:#ffffff; --card2:#f2f4f7; --line:#e3e6ea;
+  --tx:#14171c; --tx2:#5a626e; --tx3:#8b929e;
+  --red:#d93a30; --amber:#c67b06; --green:#16a34a; --orange:#dc6510; --blue:#2563eb; --purple:#7c3aed;
+  --ok:#16a34a; --warn:#c67b06; --bad:#d93a30;
+  --shadow:0 1px 2px rgba(16,20,28,.05), 0 1px 8px rgba(16,20,28,.04);
+}
+html[data-theme="light"] .card{box-shadow:var(--shadow)}
+html[data-theme="light"] .top,
+html[data-theme="light"] .tabs{background:rgba(255,255,255,.92)}
+html[data-theme="light"] input,
+html[data-theme="light"] select,
+html[data-theme="light"] textarea{background:#fff}
+html[data-theme="light"] input[readonly]{background:#f2f4f7}
+html[data-theme="light"] tbody tr:hover{background:#f6f7f9}
+html[data-theme="light"] td{border-bottom-color:#eef0f3}
+html[data-theme="light"] .toggle{background:#cfd4db}
+html[data-theme="light"] .toggle::after{background:#fff}
+html[data-theme="light"] .toggle.on{background:#16a34a}
+html[data-theme="light"] .toggle.on::after{background:#fff}
+html[data-theme="light"] .btn{background:#14171c;color:#fff}
+html[data-theme="light"] .btn:hover{background:#000}
+html[data-theme="light"] .btn.g{background:#fff;color:var(--tx)}
+html[data-theme="light"] .btn.dg{background:#fff;border-color:#e9b5b1;color:#b93a30}
+html[data-theme="light"] .btn.dg:hover{background:#fdf2f1}
+html[data-theme="light"] .chip.on{background:#14171c;color:#fff;border-color:#14171c}
+html[data-theme="light"] .call.buy{background:#eefbf3;border-color:#b7e6c9;color:#146b38}
+html[data-theme="light"] .call.sell{background:#fdf1f0;border-color:#f2c4bf;color:#a2352c}
+html[data-theme="light"] .call.hold{background:#f4f6f8;border-color:#e3e6ea;color:var(--tx2)}
+html[data-theme="light"] .call.warn{background:#fdf6e7;border-color:#f0dcae;color:#8a6206}
+html[data-theme="light"] .call b{color:#14171c}
+html[data-theme="light"] .badge.a{background:#fdf1ee;border-color:#f0c8bd;color:#a8452e}
+html[data-theme="light"] .badge.s{background:#eef4fb;border-color:#c4d8ef;color:#25578c}
+html[data-theme="light"] .toast{background:#14171c;color:#fff}
+html[data-theme="light"] .foot{color:#aeb4bd}
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
 body{
@@ -162,6 +200,26 @@ textarea{min-height:110px;resize:vertical;line-height:1.6}
 svg{display:block;max-width:100%}
 .scroll-x{overflow-x:auto}
 </style>
+<script>
+(function(){
+  var t = null;
+  try { t = localStorage.getItem('lev2mode:theme'); } catch(e){}
+  var mq = window.matchMedia('(prefers-color-scheme: light)');
+  function apply(m){
+    var eff = (m==='system'||!m) ? (mq.matches?'light':'dark') : m;
+    document.documentElement.setAttribute('data-theme', eff);
+    var mt = document.querySelector('meta[name="theme-color"]');
+    if(mt) mt.setAttribute('content', eff==='light' ? '#f6f7f9' : '#08090b');
+  }
+  window.__themeApply = apply;
+  window.__themeMQ = mq;
+  apply(t||'system');
+  mq.addEventListener('change', function(){
+    var cur=null; try{ cur=localStorage.getItem('lev2mode:theme'); }catch(e){}
+    if(!cur||cur==='system') apply('system');
+  });
+})();
+</script>
 </head>
 <body>
 
@@ -170,6 +228,7 @@ svg{display:block;max-width:100%}
   <div class="sp"></div>
   <span id="syncDot" style="font-size:10px;color:var(--tx3)" title="클라우드 동기화 상태">●</span>
   <div class="today" id="topDate"></div>
+  <button class="icobtn" id="btnTheme" title="화면 테마">◐</button>
   <button class="icobtn" id="btnSync" title="저장소 최신본 다시 불러오기">동기화</button>
   <button class="icobtn" id="btnSave">저장</button>
 </div></div>
@@ -220,6 +279,33 @@ const Store = {
     return true;
   }
 };
+
+/* ============================================================
+   1-2. 자격증명 보안 (PIN 기반 AES-GCM 암호화)
+   ── 웹앱 주소·접근 토큰은 평문 저장하지 않고, PIN으로 봉인할 수 있습니다.
+      PIN을 걸면 앱을 열 때마다 PIN을 입력해야 시트에 접근합니다.
+   ============================================================ */
+const CRED_KEY='lev2mode:cred', CRED_FIELDS=['gsUrl','gsToken','tdKey'];
+const b64={ enc:buf=>btoa(String.fromCharCode(...new Uint8Array(buf))),
+            dec:str=>Uint8Array.from(atob(str), c=>c.charCodeAt(0)) };
+async function deriveKey(pin, salt){
+  const base=await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:250000, hash:'SHA-256'},
+    base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+}
+async function sealCreds(pin, obj){
+  const salt=crypto.getRandomValues(new Uint8Array(16)), iv=crypto.getRandomValues(new Uint8Array(12));
+  const key=await deriveKey(pin, salt);
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(JSON.stringify(obj)));
+  return {v:1, s:b64.enc(salt), i:b64.enc(iv), c:b64.enc(ct)};
+}
+async function openCreds(pin, box){
+  const key=await deriveKey(pin, b64.dec(box.s));
+  const pt=await crypto.subtle.decrypt({name:'AES-GCM', iv:b64.dec(box.i)}, key, b64.dec(box.c));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+const credBox=()=>{ try{ return JSON.parse(localStorage.getItem(CRED_KEY)||'null'); }catch(e){ return null; } };
+const isLocked=()=>!!credBox();
 
 /* ============================================================
    2. 유틸
@@ -299,13 +385,16 @@ function newBook(o){
     baseMode:'공세', manualMode:'자동', useRSI:true,
     sellDayBuyRule:2,
     riskState:'정상', riskRatio:1, safeCut:false, safeCutRatio:0.5,
+    vxnOn:false, vxnCalm:20, vxnWarn:28, vxnPanic:36,
+    vxnCalmRatio:1.2, vxnNormRatio:1, vxnWarnRatio:0.5, vxnPanicRatio:0,
+    vxnForceSafe:true, vxnSeries:[],
     rsiPeriod:18, rsiUpper:66, rsiLower:38,
     weekly:[], lots:[], records:[]
   }, o||{});
 }
 const DEFAULT = {
   v:1, fx:1469.4, useBookCash:false,
-  gsUrl:'', tdKey:'', syncToken:'', syncLinked:false, cloudSavedAt:'', autoFetch:true, lastFetch:'', lastFetchDay:'', savedAt:0,
+  gsUrl:'', gsToken:'', tdKey:'', syncLinked:false, cloudSavedAt:'', theme:'system', autoFetch:true, lastFetch:'', lastFetchDay:'', savedAt:0,
   cashKRW:0, cashUSD:0, principalKRW:0,
   holdings:[{t:'SOXL',q:0,p:0},{t:'TQQQ',q:0,p:0}],
   snapshots:[],
@@ -320,7 +409,14 @@ const DEFAULT = {
 };
 let S = JSON.parse(JSON.stringify(DEFAULT));
 
-async function save(){ S.savedAt=Date.now(); await Store.set(S); cloudPush(); }
+async function save(){
+  S.savedAt=Date.now();
+  if(isLocked()){                      // 잠금 시 자격증명은 로컬 평문 저장에서 제외
+    const keep={}; CRED_FIELDS.forEach(f=>{ keep[f]=S[f]; S[f]=''; });
+    await Store.set(S); CRED_FIELDS.forEach(f=> S[f]=keep[f]);
+  } else await Store.set(S);
+  cloudPush();
+}
 let saveTimer=null;
 function touch(){ clearTimeout(saveTimer); saveTimer=setTimeout(save,400); }
 
@@ -363,6 +459,33 @@ function autoMode(b){
 /* ============================================================
    5. 매매 엔진  (SOXL/TQQQ 2모드매매 시트 ①~⑦ 이식)
    ============================================================ */
+/* ── VXN 기반 변동성 필터 ─────────────────────────────────
+   VXN(나스닥100 변동성지수) 수준으로 신규매수 투입액을 조절한다.
+   낮으면 증액, 높으면 감액, 패닉 구간은 신규매수 중단.
+   보유 로트의 익절·기한 매도는 영향받지 않는다(청산은 항상 허용). */
+function vxnState(b){
+  const on=!!b.vxnOn;
+  const ser=(b.vxnSeries||[]).filter(x=>x&&x.d&&num(x.c)>0).sort((x,y)=> x.d<y.d?-1:1);
+  const cut=lastCompletedUsSession();
+  const usable=ser.filter(x=> x.d<=cut);
+  const last=usable.length? usable[usable.length-1] : null;
+  const prev=usable.length>1? usable[usable.length-2] : null;
+  if(!on)   return {on:false, level:'미사용', ratio:null, forceSafe:false, last, prev, stale:null};
+  if(!last) return {on:true,  level:'데이터 없음', ratio:null, forceSafe:false, last:null, prev:null, stale:null,
+                    warn:'VXN 시계열이 없습니다 — 시세 갱신에서 VXN을 받아오거나 직접 입력하세요'};
+  const v=num(last.c);
+  let level,ratio;
+  if(v < num(b.vxnCalm))       { level='안정'; ratio=num(b.vxnCalmRatio); }
+  else if(v < num(b.vxnWarn))  { level='보통'; ratio=num(b.vxnNormRatio); }
+  else if(v < num(b.vxnPanic)) { level='경계'; ratio=num(b.vxnWarnRatio); }
+  else                         { level='패닉'; ratio=num(b.vxnPanicRatio); }
+  const stale=Math.max(0, networkDays(D(last.d), D(cut))-1);
+  return {on:true, level, ratio, v, last, prev,
+          chg: prev? v-num(prev.c) : null, stale,
+          forceSafe: !!b.vxnForceSafe && (level==='경계'||level==='패닉'),
+          warn: stale>=2? `VXN 기록이 ${stale}거래일 오래됐습니다`:''};
+}
+
 function engine(b){
   const fx = S.fx||1;
   const E = {};
@@ -397,11 +520,13 @@ function engine(b){
   // ③ 모드
   const am = autoMode(b);
   E.rsi = am;
+  E.vxn = vxnState(b);
   let mode;
   if(b.manualMode!=='자동') mode=b.manualMode;
   else if(!b.useRSI) mode=b.baseMode;
   else if(b.riskState==='방어') mode='안전';
   else if(b.riskState==='안전') mode='안전';
+  else if(E.vxn.forceSafe) mode='안전';
   else mode=am.mode;
   E.mode = mode;
   E.target = mode==='안전'? b.safeTarget : b.aggrTarget;   // B35
@@ -410,6 +535,7 @@ function engine(b){
   // 위험필터 매수비율 (G30) + 안전모드 매수축소
   let ratio = b.riskState==='방어' ? 0 : num(b.riskRatio);
   if(b.safeCut && mode==='안전') ratio = Math.min(ratio, num(b.safeCutRatio));
+  if(E.vxn.on && E.vxn.ratio!=null) ratio = ratio * E.vxn.ratio;   // VXN 배수 적용
   E.ratio = ratio;
 
   // ⑤ 로트 원장
@@ -441,16 +567,18 @@ function engine(b){
 
   // ④ 오늘 주문
   E.buyLimit = r2(r2(E.prevClose*(1+b.buyLimitPct)) - 0.01);   // D40
-  E.full = E.lots.length >= b.splits;
-  E.buyQty = (!E.allowBuy || E.full || E.buyLimit<=0) ? 0
+  E.full = E.lots.length >= b.splits;      // 표시용 — 매수 차단 조건에서는 제외
+  E.over = E.lots.length > b.splits;
+  E.buyQty = (!E.allowBuy || E.buyLimit<=0) ? 0
            : Math.floor(Math.min(E.chunk*ratio, E.cash)*(1-b.fee)/E.buyLimit);   // B40
   E.buyAmt = E.buyQty*E.buyLimit;
 
   E.buyMsg = !E.allowBuy ? '매수 금지 — 매도일 매수금지 규칙'
-           : E.full ? '매수 불가 — 보유 덩이가 가득 찼습니다'
-           : ratio===0 ? '신규매수 중단 — 위험필터 방어 상태'
+           : ratio===0 ? (E.vxn.on && E.vxn.level==='패닉' ? ' 신규매수 중단 — VXN 패닉 구간' : '신규매수 중단 — 위험필터 방어 상태')
            : E.buyQty===0 ? '수량 0 — 예수금 부족 또는 매수비율 축소'
-           : `LOC 매수 ${E.buyQty}주 @ ${fUSD(E.buyLimit)}` + (ratio<1?` · 위험필터 투입액 ${Math.round(ratio*100)}% 적용`:'');
+           : `LOC 매수 ${E.buyQty}주 @ ${fUSD(E.buyLimit)}`
+             + (ratio!==1?` · 투입액 ${Math.round(ratio*100)}% 적용`:'')
+             + (E.over?` · 보유 덩이 ${E.lots.length}/${b.splits} 초과`:'');
 
   E.ladder = ladder(b,E);
   return E;
@@ -727,6 +855,7 @@ function renderBook(k){
         <dt>매수 지정가</dt><dd>${fUSD(E.buyLimit)}</dd>
         <dt>예상 매수금</dt><dd>${fUSD(E.buyAmt)}</dd>
         <dt>매수 판정</dt><dd>${esc(E.buyVerdict)}</dd>
+        ${E.vxn.on? `<dt>VXN</dt><dd>${E.vxn.v!=null? E.vxn.v.toFixed(2)+' · '+E.vxn.level+' ×'+(E.vxn.ratio??1).toFixed(2) : '데이터 없음'}</dd>`:''}
       </div>
     </div>
     <div class="call ${E.sellQty>0?'sell':'hold'}">
@@ -773,83 +902,9 @@ function renderBook(k){
     </div>
   </div>
 
-  <!-- ② 전략 파라미터 -->
-  <div class="sec">
-    <div class="sec-h"><span class="n">②</span><h2>전략 파라미터</h2></div>
-    <div class="card"><div class="fgrid c3">
-      ${fld(k+':splits','분할 수 (덩이)',b.splits)}
-      ${fld(k+':fee','매매 수수료 (0.0025=0.25%)',b.fee)}
-      ${fld(k+':buyLimitPct','매수 제한 상승률',b.buyLimitPct)}
-      ${fld(k+':aggrTarget','[공세] 목표수익률',b.aggrTarget)}
-      ${fld(k+':aggrDays','[공세] 최대 보유일',b.aggrDays)}
-      ${fld(k+':safeTarget','[안전] 목표수익률',b.safeTarget)}
-      ${fld(k+':safeDays','[안전] 최대 보유일',b.safeDays)}
-      <label class="f"><span class="l">기준 모드 (신호 없을 때)</span>
-        <select data-b="${k}:baseMode"><option ${b.baseMode==='공세'?'selected':''}>공세</option><option ${b.baseMode==='안전'?'selected':''}>안전</option></select></label>
-      <label class="f"><span class="l">매도일 매수금지 규칙</span>
-        <select data-b="${k}:sellDayBuyRule">
-          <option value="0" ${b.sellDayBuyRule==0?'selected':''}>0 · 미적용</option>
-          <option value="1" ${b.sellDayBuyRule==1?'selected':''}>1 · 손실 매도 1건 이상이면 매수</option>
-          <option value="2" ${b.sellDayBuyRule==2?'selected':''}>2 · 전부 손실일 때만 매수</option>
-        </select></label>
-    </div></div>
-  </div>
-
-  <!-- ②-2 위험필터 -->
-  <div class="sec">
-    <div class="sec-h"><span class="n">②-2</span><h2>위험 필터</h2><span class="hint">신규매수에만 적용</span></div>
-    <div class="card">
-      <div class="sw"><div class="t">RSI 2모드 자동 판정 사용<small>끄면 기준 모드로 고정</small></div>
-        <button class="toggle ${b.useRSI?'on':''}" data-tb="${k}:useRSI"></button></div>
-      <div class="sw"><div class="t">안전모드 매수 축소<small>안전모드일 때 1덩이 금액을 ${Math.round(b.safeCutRatio*100)}%로</small></div>
-        <button class="toggle ${b.safeCut?'on':''}" data-tb="${k}:safeCut"></button></div>
-      <div class="fgrid c3" style="margin-top:14px">
-        <label class="f"><span class="l">위험 종합 판정</span>
-          <select data-b="${k}:riskState">
-            ${['정상','안전','방어'].map(v=>`<option ${b.riskState===v?'selected':''}>${v}</option>`).join('')}
-          </select></label>
-        ${fld(k+':riskRatio','적용 매수비율 (1 = 100%)',b.riskRatio)}
-        ${fld(k+':safeCutRatio','안전모드 매수비율',b.safeCutRatio)}
-      </div>
-      <div class="note">200일 MA·실현변동성·VXN·Breadth·ADX 판정 결과를 <b>정상 / 안전 / 방어</b> 중 하나로 입력하면 시트와 동일하게 동작합니다.
-        <b>방어</b>는 신규매수 0, <b>안전</b>은 모드를 안전으로 강제합니다. 현재 적용 매수비율 <b>${Math.round(E.ratio*100)}%</b>.</div>
-    </div>
-  </div>
-
-  <!-- ③ 현재 모드 -->
-  <div class="sec">
-    <div class="sec-h"><span class="n">③</span><h2>현재 모드</h2><span class="hint">${b.rsiSource} 주간 RSI</span></div>
-    <div class="card">
-      <div class="grid g2">
-        <div>
-          <div style="font-size:13px;color:var(--tx2);margin-bottom:8px">적용 모드 ${modeBadge}</div>
-          <div class="dl">
-            <dt>이번주 RSI</dt><dd>${rsiRow&&rsiRow.rsi!=null? rsiRow.rsi.toFixed(1):'—'}</dd>
-            <dt>주 마감일</dt><dd>${rsiRow? rsiRow.d:'—'}</dd>
-            <dt>전환 신호</dt><dd>${rsiRow&&rsiRow.sig? rsiRow.sig:'유지'}</dd>
-            <dt>적용 시작일</dt><dd>${rsiRow? rsiRow.apply:'—'}</dd>
-            <dt>목표수익률</dt><dd>${fPct(E.target,1)}</dd>
-            <dt>최대 보유일</dt><dd>${E.limit} 거래일</dd>
-          </div>
-        </div>
-        <div class="fgrid" style="grid-template-columns:1fr 1fr">
-          ${fld(k+':rsiPeriod','RSI 기간 (주)',b.rsiPeriod)}
-          <label class="f"><span class="l">수동 지정</span>
-            <select data-b="${k}:manualMode">${['자동','공세','안전'].map(v=>`<option ${b.manualMode===v?'selected':''}>${v}</option>`).join('')}</select></label>
-          ${fld(k+':rsiUpper','RSI 상단 (꺾이면 안전)',b.rsiUpper)}
-          ${fld(k+':rsiLower','RSI 하단 (고개들면 공세)',b.rsiLower)}
-        </div>
-      </div>
-      <label class="f" style="margin-top:14px"><span class="l">${b.rsiSource} 주간 종가 붙여넣기 — 「날짜(금) 종가」 한 줄에 하나</span>
-        <textarea id="wk-${k}" placeholder="2026-07-17\t566.12&#10;2026-07-24\t571.40">${(b.weekly||[]).map(w=>w.d+'\t'+w.c).join('\n')}</textarea></label>
-      <div class="btnrow"><button class="btn sm" data-wk="${k}">주간 종가 반영</button>
-        <span class="note" style="margin:0;align-self:center">${(b.weekly||[]).length}주 입력됨 · RSI는 Wilder 방식(시트와 동일)으로 계산됩니다</span></div>
-    </div>
-  </div>
-
   <!-- ⑤ 보유 로트 원장 -->
   <div class="sec">
-    <div class="sec-h"><span class="n">⑤</span><h2>보유 로트 원장</h2><span class="hint">${E.lots.length} / ${b.splits} 덩이</span></div>
+    <div class="sec-h"><span class="n">⑤</span><h2>보유 로트 원장</h2><span class="hint" style="${E.over?'color:var(--warn)':''}">${E.lots.length} / ${b.splits} 덩이${E.over?' (초과)':''}</span></div>
     <div class="card"><div class="tw"><table style="min-width:820px">
       <thead><tr><th>#</th><th>매수일</th><th>매수가</th><th>수량</th><th>모드</th><th>목표매도가</th><th>경과</th><th>기한</th><th>주문 유형</th><th>오늘 매도</th><th></th></tr></thead>
       <tbody>${E.lots.length? E.lots.map((l,i)=>`<tr>
@@ -866,7 +921,8 @@ function renderBook(k){
     </table></div>
     <div class="btnrow"><button class="btn sm" data-ladd="${k}">로트 추가</button>
       <button class="btn sm g" data-lbuy="${k}">오늘 매수분 로트로 추가 (${E.buyQty}주)</button></div>
-    <div class="note">매도 체결 시 해당 행을 삭제하고, 신규 매수 체결 시 종가·수량으로 행을 추가하세요. 모드는 <b>매수 시점에 고정</b>됩니다.</div>
+    <div class="note">매도 체결 시 해당 행을 삭제하고, 신규 매수 체결 시 종가·수량으로 행을 추가하세요. 모드는 <b>매수 시점에 고정</b>됩니다.
+      로트 수는 분할 수를 넘을 수 있으며, 초과해도 매수는 차단되지 않습니다. 실제 투입 한도는 예수금이 결정합니다.</div>
     </div>
   </div>
 
@@ -911,6 +967,121 @@ function renderBook(k){
       </table></div>
       <div class="note">이 기록이 ① 투자 요약의 예수금·보유수량·손익 계산 근거입니다. 매매가 없는 날은 입력하지 않아도 됩니다.</div>
     </div>
+  </div>
+
+  <!-- ② 전략 파라미터 -->
+  <div class="sec">
+    <div class="sec-h"><span class="n">②</span><h2>전략 파라미터</h2></div>
+    <div class="card"><div class="fgrid c3">
+      ${fld(k+':splits','분할 수 (덩이)',b.splits)}
+      ${fld(k+':fee','매매 수수료 (0.0025=0.25%)',b.fee)}
+      ${fld(k+':buyLimitPct','매수 제한 상승률',b.buyLimitPct)}
+      ${fld(k+':aggrTarget','[공세] 목표수익률',b.aggrTarget)}
+      ${fld(k+':aggrDays','[공세] 최대 보유일',b.aggrDays)}
+      ${fld(k+':safeTarget','[안전] 목표수익률',b.safeTarget)}
+      ${fld(k+':safeDays','[안전] 최대 보유일',b.safeDays)}
+      <label class="f"><span class="l">기준 모드 (신호 없을 때)</span>
+        <select data-b="${k}:baseMode"><option ${b.baseMode==='공세'?'selected':''}>공세</option><option ${b.baseMode==='안전'?'selected':''}>안전</option></select></label>
+      <label class="f"><span class="l">매도일 매수금지 규칙</span>
+        <select data-b="${k}:sellDayBuyRule">
+          <option value="0" ${b.sellDayBuyRule==0?'selected':''}>0 · 미적용</option>
+          <option value="1" ${b.sellDayBuyRule==1?'selected':''}>1 · 손실 매도 1건 이상이면 매수</option>
+          <option value="2" ${b.sellDayBuyRule==2?'selected':''}>2 · 전부 손실일 때만 매수</option>
+        </select></label>
+    </div></div>
+  </div>
+
+  <!-- ②-2 위험필터 -->
+  <div class="sec">
+    <div class="sec-h"><span class="n">②-2</span><h2>위험 필터</h2><span class="hint">신규매수에만 적용</span></div>
+    <div class="card">
+      <div class="sw"><div class="t">RSI 2모드 자동 판정 사용<small>끄면 기준 모드로 고정</small></div>
+        <button class="toggle ${b.useRSI?'on':''}" data-tb="${k}:useRSI"></button></div>
+      <div class="sw"><div class="t">안전모드 매수 축소<small>안전모드일 때 1덩이 금액을 ${Math.round(b.safeCutRatio*100)}%로</small></div>
+        <button class="toggle ${b.safeCut?'on':''}" data-tb="${k}:safeCut"></button></div>
+      <div class="fgrid c3" style="margin-top:14px">
+        <label class="f"><span class="l">위험 종합 판정</span>
+          <select data-b="${k}:riskState">
+            ${['정상','안전','방어'].map(v=>`<option ${b.riskState===v?'selected':''}>${v}</option>`).join('')}
+          </select></label>
+        ${fld(k+':riskRatio','적용 매수비율 (1 = 100%)',b.riskRatio)}
+        ${fld(k+':safeCutRatio','안전모드 매수비율',b.safeCutRatio)}
+      </div>
+      <div class="note">200일 MA·실현변동성·Breadth·ADX 판정 결과를 <b>정상 / 안전 / 방어</b> 중 하나로 입력하면 시트와 동일하게 동작합니다.
+        <b>방어</b>는 신규매수 0, <b>안전</b>은 모드를 안전으로 강제합니다. 최종 적용 매수비율 <b>${Math.round(E.ratio*100)}%</b>.</div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="sw"><div class="t">VXN 변동성 매매법 사용
+        <small>나스닥100 변동성지수(VXN) 구간에 따라 신규매수 투입액을 자동 조절</small></div>
+        <button class="toggle ${b.vxnOn?'on':''}" data-tb="${k}:vxnOn"></button></div>
+      ${b.vxnOn? `
+      <div class="grid g2" style="margin-top:14px">
+        <div>
+          <div class="dl">
+            <dt>현재 VXN</dt><dd>${E.vxn.v!=null? E.vxn.v.toFixed(2):'—'}</dd>
+            <dt>기준일</dt><dd>${E.vxn.last? E.vxn.last.d:'—'}</dd>
+            <dt>전일 대비</dt><dd class="${E.vxn.chg>0?'down':E.vxn.chg<0?'up':''}">${E.vxn.chg!=null? (E.vxn.chg>0?'+':'')+E.vxn.chg.toFixed(2):'—'}</dd>
+            <dt>구간</dt><dd><span class="badge ${E.vxn.level==='패닉'||E.vxn.level==='경계'?'a':'s'}">${esc(E.vxn.level)}</span></dd>
+            <dt>투입 배수</dt><dd>${E.vxn.ratio!=null? '×'+E.vxn.ratio.toFixed(2):'—'}</dd>
+            <dt>모드 강제</dt><dd>${E.vxn.forceSafe?'안전 모드로 전환됨':'없음'}</dd>
+          </div>
+          ${E.vxn.warn? `<div class="call warn" style="margin-top:10px">${esc(E.vxn.warn)}</div>`:''}
+        </div>
+        <div>
+          <div class="fgrid" style="grid-template-columns:1fr 1fr">
+            ${fld(k+':vxnCalm','안정 상한',b.vxnCalm)}
+            ${fld(k+':vxnCalmRatio','안정 배수',b.vxnCalmRatio)}
+            ${fld(k+':vxnWarn','경계 하한',b.vxnWarn)}
+            ${fld(k+':vxnNormRatio','보통 배수',b.vxnNormRatio)}
+            ${fld(k+':vxnPanic','패닉 하한',b.vxnPanic)}
+            ${fld(k+':vxnWarnRatio','경계 배수',b.vxnWarnRatio)}
+            ${fld(k+':vxnPanicRatio','패닉 배수',b.vxnPanicRatio)}
+          </div>
+          <div class="sw" style="margin-top:8px"><div class="t">경계·패닉이면 안전모드 강제</div>
+            <button class="toggle ${b.vxnForceSafe?'on':''}" data-tb="${k}:vxnForceSafe"></button></div>
+        </div>
+      </div>
+      <label class="f" style="margin-top:14px"><span class="l">VXN 일별 종가 — 「날짜 값」 한 줄에 하나 (시세 갱신 시 자동 채워짐)</span>
+        <textarea id="vx-${k}" placeholder="2026-07-22\t21.40&#10;2026-07-23\t22.10">${(b.vxnSeries||[]).slice(-120).map(w=>w.d+'\t'+w.c).join('\n')}</textarea></label>
+      <div class="btnrow"><button class="btn sm" data-vx="${k}">VXN 반영</button>
+        <span class="note" style="margin:0;align-self:center">${(b.vxnSeries||[]).length}일 보관 · 완료된 세션만 판정에 사용</span></div>
+      <div class="note"><b>동작 규칙</b> — VXN &lt; ${b.vxnCalm}: 안정(×${b.vxnCalmRatio}) · ${b.vxnCalm}~${b.vxnWarn}: 보통(×${b.vxnNormRatio}) ·
+        ${b.vxnWarn}~${b.vxnPanic}: 경계(×${b.vxnWarnRatio}) · ${b.vxnPanic} 이상: 패닉(×${b.vxnPanicRatio}).
+        이 배수는 <b>신규매수 투입액에만</b> 곱해집니다. 보유 로트의 익절·기한 매도는 그대로 실행되므로 청산이 막히지 않습니다.</div>
+      `:'<div class="note">끄면 VXN은 계산에 전혀 반영되지 않습니다.</div>'}
+    </div>
+  </div>
+
+  <!-- ③ 현재 모드 -->
+  <div class="sec">
+    <div class="sec-h"><span class="n">③</span><h2>현재 모드</h2><span class="hint">${b.rsiSource} 주간 RSI</span></div>
+    <div class="card">
+      <div class="grid g2">
+        <div>
+          <div style="font-size:13px;color:var(--tx2);margin-bottom:8px">적용 모드 ${modeBadge}</div>
+          <div class="dl">
+            <dt>이번주 RSI</dt><dd>${rsiRow&&rsiRow.rsi!=null? rsiRow.rsi.toFixed(1):'—'}</dd>
+            <dt>주 마감일</dt><dd>${rsiRow? rsiRow.d:'—'}</dd>
+            <dt>전환 신호</dt><dd>${rsiRow&&rsiRow.sig? rsiRow.sig:'유지'}</dd>
+            <dt>적용 시작일</dt><dd>${rsiRow? rsiRow.apply:'—'}</dd>
+            <dt>목표수익률</dt><dd>${fPct(E.target,1)}</dd>
+            <dt>최대 보유일</dt><dd>${E.limit} 거래일</dd>
+          </div>
+        </div>
+        <div class="fgrid" style="grid-template-columns:1fr 1fr">
+          ${fld(k+':rsiPeriod','RSI 기간 (주)',b.rsiPeriod)}
+          <label class="f"><span class="l">수동 지정</span>
+            <select data-b="${k}:manualMode">${['자동','공세','안전'].map(v=>`<option ${b.manualMode===v?'selected':''}>${v}</option>`).join('')}</select></label>
+          ${fld(k+':rsiUpper','RSI 상단 (꺾이면 안전)',b.rsiUpper)}
+          ${fld(k+':rsiLower','RSI 하단 (고개들면 공세)',b.rsiLower)}
+        </div>
+      </div>
+      <label class="f" style="margin-top:14px"><span class="l">${b.rsiSource} 주간 종가 붙여넣기 — 「날짜(금) 종가」 한 줄에 하나</span>
+        <textarea id="wk-${k}" placeholder="2026-07-17\t566.12&#10;2026-07-24\t571.40">${(b.weekly||[]).map(w=>w.d+'\t'+w.c).join('\n')}</textarea></label>
+      <div class="btnrow"><button class="btn sm" data-wk="${k}">주간 종가 반영</button>
+        <span class="note" style="margin:0;align-self:center">${(b.weekly||[]).length}주 입력됨 · RSI는 Wilder 방식(시트와 동일)으로 계산됩니다</span></div>
+    </div>
   </div>`;
   bindBook(k);
 }
@@ -950,6 +1121,15 @@ function bindBook(k){
     S.books[k].lots.push({d:todayISO(), p:E.prevClose, q:E.buyQty, mode:E.mode});
     S.books[k].records.push({d:todayISO(), close:E.prevClose, buy:E.buyQty, sell:0});
     touch(); renderBook(k); toast('로트와 기록에 추가했습니다'); });
+  $$('[data-vx]',root).forEach(el=> el.onclick=()=>{
+    const out=[];
+    ($('#vx-'+k).value||'').split(/\n/).forEach(line=>{
+      const m=line.trim().split(/[\t, ]+/).filter(Boolean); if(m.length<2) return;
+      const d=m[0].replace(/[./]/g,'-'), c=num(m[1]); if(!/^\d{4}-\d{1,2}-\d{1,2}$/.test(d)||!c) return;
+      const [y,mo,da]=d.split('-'); out.push({d:`${y}-${mo.padStart(2,'0')}-${da.padStart(2,'0')}`, c});
+    });
+    S.books[k].vxnSeries = out.sort((a,c)=> a.d<c.d?-1:1); touch(); renderBook(k);
+    toast(out.length+'일 반영'); });
   $$('[data-wk]',root).forEach(el=> el.onclick=()=>{
     const txt=$('#wk-'+k).value, out=[];
     txt.split(/\n/).forEach(line=>{
@@ -985,6 +1165,8 @@ function renderSet(){
     <div class="card">
       <label class="f"><span class="l">Apps Script 웹앱 URL (…/exec 로 끝나는 주소)</span>
         <input data-s2="gsUrl" value="${esc(S.gsUrl||'')}" placeholder="https://script.google.com/macros/s/AKfy…/exec"></label>
+      <label class="f" style="margin-top:12px"><span class="l">접근 토큰 (시트 메뉴 → 접근 토큰 발급)</span>
+        <input data-s2="gsToken" type="password" value="${esc(S.gsToken||'')}" placeholder="generateToken 실행 후 나오는 40자 토큰"></label>
       <label class="f" style="margin-top:12px"><span class="l">Twelve Data API 키 (선택 · 아래 참고)</span>
         <input data-s2="tdKey" value="${esc(S.tdKey||'')}" placeholder="twelvedata.com 무료 가입 후 발급되는 키"></label>
       <div class="note">구글시트가 막히는 환경(사내망 등)을 위한 예비 소스입니다. twelvedata.com 에서 무료 가입하면
@@ -1037,15 +1219,14 @@ function renderSet(){
     <div class="sec-h"><span class="n">02</span><h2>기기 간 동기화 (구글시트)</h2>
       <span class="hint" id="syncHint">${syncReady()?'설정됨':'미설정'}</span></div>
     <div class="card">
-      <label class="f"><span class="l">동기화 암호 (Apps Script 상단 TOKEN 과 동일하게)</span>
-        <input data-s2="syncToken" value="${esc(S.syncToken||'')}" placeholder="스크립트의 TOKEN='CHANGE-ME' 를 바꾼 값"></label>
+      <div class="note" style="margin:0 0 12px">위 <b>구글시트 연동</b>의 웹앱 주소와 접근 토큰을 그대로 사용합니다.</div>
       <div class="btnrow">
         <button class="btn" id="pullBtn">클라우드에서 받기</button>
         <button class="btn g" id="pushBtn">클라우드로 올리기</button>
         <button class="btn g" id="pingBtn">연결 확인</button>
       </div>
       <div id="syncDiag" style="margin-top:10px"></div>
-      <div class="note">위 <b>구글시트 연동 URL</b>을 그대로 사용합니다. 데이터는 <b>본인 시트의 _sync 탭</b>에만 저장되고,
+      <div class="note">데이터는 <b>본인 시트의 _CONFIG 탭</b>에만 저장되고,
         저장 버튼을 누를 때마다 자동으로 올라갑니다. 다른 기기에서는 앱을 열고 <b>클라우드에서 받기</b> 한 번이면 이어서 작업할 수 있습니다.
         Claude 아티팩트 안에서는 외부 접속이 차단되어 이 동기화가 동작하지 않습니다 — 파일로 열거나 웹에 올려서 사용하세요.</div>
     </div>
@@ -1070,7 +1251,27 @@ function renderSet(){
   </div>
 
   <div class="sec">
-    <div class="sec-h"><span class="n">03</span><h2>매매 규칙 요약</h2></div>
+    <div class="sec-h"><span class="n">03</span><h2>화면 · 보안</h2>
+      <span class="hint">${isLocked()?'PIN 잠금 사용 중':'잠금 없음'}</span></div>
+    <div class="card">
+      <div class="l" style="font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;color:var(--tx3);text-transform:uppercase;margin-bottom:8px">화면 테마</div>
+      <div class="chips">
+        ${['system','light','dark'].map(t=>`<span class="chip ${(S.theme||'system')===t?'on':''}" data-theme="${t}">${t==='system'?'시스템 설정':t==='light'?'밝게':'어둡게'}</span>`).join('')}
+      </div>
+      <div class="note">시스템 설정을 고르면 기기의 다크모드 설정을 따라갑니다.</div>
+
+      <div class="sw" style="margin-top:16px"><div class="t">PIN 잠금
+        <small>웹앱 주소·접근 토큰을 PIN으로 암호화해 보관합니다 (AES-GCM, PBKDF2 25만회)</small></div>
+        <button class="btn sm ${isLocked()?'dg':''}" id="pinBtn">${isLocked()?'잠금 해제':'PIN 설정'}</button></div>
+      <div id="pinDiag" style="margin-top:8px"></div>
+      <div class="note">잠금을 켜면 이 브라우저에 <b>평문 자격증명이 남지 않습니다.</b> 앱을 열 때 PIN을 입력해야 시트에 접근합니다.
+        기기를 분실하거나 저장소를 누가 열어봐도 주소·토큰을 알아낼 수 없습니다.
+        <b>PIN은 복구할 수 없습니다</b> — 잊으면 주소와 토큰을 다시 입력해야 합니다(시트 데이터는 안전합니다).</div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-h"><span class="n">04</span><h2>매매 규칙 요약</h2></div>
     <div class="card">
       <div class="note" style="font-size:13px;color:var(--tx2)">
         · 1덩이 투입액 = 총 최초 투자금 ÷ 분할 수 (고정, 비복리)<br>
@@ -1106,6 +1307,30 @@ function renderSet(){
   $$('#p-set [data-s2]').forEach(el=> el.onchange=()=>{ S[el.dataset.s2]=el.value.trim(); touch(); renderSet(); });
   $$('#p-set [data-tg2]').forEach(el=> el.onclick=()=>{ S[el.dataset.tg2]=!S[el.dataset.tg2]; touch(); renderSet(); });
   $('#scriptBtn').onclick = ()=>{ const b=$('#scriptBox'); b.style.display = b.style.display==='none'?'block':'none'; };
+  $$('#p-set [data-theme]').forEach(el=> el.onclick=()=>{
+    S.theme=el.dataset.theme; try{ localStorage.setItem('lev2mode:theme', S.theme); }catch(e){}
+    window.__themeApply(S.theme); touch(); renderSet(); });
+  $('#pinBtn').onclick = async()=>{
+    const pd=m=>$('#pinDiag').innerHTML=m;
+    if(isLocked()){
+      const pin=prompt('현재 PIN을 입력하면 잠금을 해제합니다.');
+      if(!pin) return;
+      try{ const c=await openCreds(pin, credBox()); Object.assign(S,c);
+        localStorage.removeItem(CRED_KEY); await Store.set(S); renderSet();
+        pd(diagLine(true,'잠금 해제','자격증명이 평문으로 저장됩니다')); }
+      catch(e){ pd(diagLine(false,'잠금 해제','PIN이 올바르지 않습니다')); }
+      return;
+    }
+    if(!S.gsUrl) return pd(diagLine(false,'PIN 설정','먼저 웹앱 주소를 입력하세요'));
+    const pin=prompt('사용할 PIN을 입력하세요 (4자 이상). 잊으면 복구할 수 없습니다.');
+    if(!pin||pin.length<4) return pd(diagLine(false,'PIN 설정','4자 이상 입력하세요'));
+    if(prompt('확인을 위해 PIN을 한 번 더 입력하세요.')!==pin)
+      return pd(diagLine(false,'PIN 설정','두 값이 다릅니다'));
+    const creds={}; CRED_FIELDS.forEach(f=> creds[f]=S[f]||'');
+    localStorage.setItem(CRED_KEY, JSON.stringify(await sealCreds(pin, creds)));
+    await save(); renderSet();
+    pd(diagLine(true,'PIN 설정','완료 — 다음 실행부터 PIN을 묻습니다'));
+  };
   $('#fetchPx').onclick = ()=> fetchPrices(false);
   const sd=m=>{ const el=$('#syncDiag'); if(el) el.innerHTML=m; };
   $('#pingBtn').onclick = async()=>{
@@ -1135,7 +1360,7 @@ function renderSet(){
     try{
       const r=await cloudPull();
       if(r.empty) return sd(diagLine(false,'받기','클라우드가 비어 있습니다 — 먼저 다른 기기에서 「클라우드로 올리기」를 하세요'));
-      const keep={gsUrl:S.gsUrl, syncToken:S.syncToken, tdKey:S.tdKey};   // 이 기기의 연결 설정 유지
+      const keep={gsUrl:S.gsUrl, gsToken:S.gsToken, tdKey:S.tdKey, theme:S.theme};   // 이 기기 설정 유지
       S=migrate(r.state); Object.assign(S,keep);
       S.savedAt=Date.now(); S.cloudSavedAt=r.savedAt; S.syncLinked=true;
       await Store.set(S); renderAll(); toast('클라우드 데이터를 불러왔습니다');
@@ -1171,6 +1396,11 @@ function applyQuote(j,src){
     }
     (S.holdings||[]).forEach(o=>{ if(o.t===k) o.p=q.last; });
   }
+  // VXN 시계열 반영
+  if(j.series && j.series.VXN && j.series.VXN.length){
+    const vs=j.series.VXN.map(r=>({d:String(r[0]).slice(0,10), c:+r[1]})).filter(x=>x.c>0);
+    ['SOXL','TQQQ'].forEach(k=>{ S.books[k].vxnSeries=vs.slice(-400); });
+  }
   if(!Object.keys(QUOTE).length) throw new Error('유효한 시세가 없습니다');
   S.lastFetch = new Date().toLocaleString('ko-KR',{hour12:false}) + (src? ' · '+src : '');
   S.lastFetchDay = todayISO();
@@ -1195,10 +1425,12 @@ function autoRecord(k,q){
   if(n) b.records.sort((a,c)=> a.d<c.d?-1:1);
   return n;
 }
-function quoteUrl(extra){
-  const t=[...new Set(['SOXL','TQQQ',...(S.holdings||[]).map(o=>o.t).filter(Boolean)])];
-  return S.gsUrl+(S.gsUrl.includes('?')?'&':'?')+'tickers='+encodeURIComponent(t.join(','))+(extra||'');
+function quoteTickers(){
+  const t=['SOXL','TQQQ',...(S.holdings||[]).map(o=>o.t).filter(Boolean)];
+  if(S.books.SOXL.vxnOn||S.books.TQQQ.vxnOn) t.push('VXN');
+  return [...new Set(t)];
 }
+function quoteUrl(){ return hubUrl({mode:'quote', ids:quoteTickers().join(','), n:400}); }
 function jsonp(url, ms){
   return new Promise((res,rej)=>{
     const cb='__q'+Math.random().toString(36).slice(2);
@@ -1220,10 +1452,13 @@ function diagLine(ok,label,msg){
 }
 /* ── 구글시트 클라우드 동기화 ─────────────────────────────
    설정된 gsUrl + syncToken 으로 앱 상태 전체를 _sync 탭에 저장/복원 */
-function syncReady(){ return !!(S.gsUrl && S.syncToken); }
-function syncUrl(action){
-  return S.gsUrl+(S.gsUrl.includes('?')?'&':'?')+'action='+action+'&token='+encodeURIComponent(S.syncToken);
+function syncReady(){ return !!S.gsUrl; }
+function hubUrl(params){
+  const q=Object.assign({token:S.gsToken||''}, params);
+  return S.gsUrl+(S.gsUrl.includes('?')?'&':'?')
+    + Object.keys(q).map(k=>k+'='+encodeURIComponent(q[k])).join('&');
 }
+function syncUrl(action){ return hubUrl({mode:action==='save'?'cfgset':'cfgget'}); }
 let pushTimer=null, lastPushErr='';
 function cloudPush(){                      // save() 에서 자동 호출 (디바운스)
   if(!syncReady()) return;
@@ -1233,16 +1468,16 @@ function cloudPush(){                      // save() 에서 자동 호출 (디�
 }
 async function doPush(force,silent){
   try{
-    const url=syncUrl('save')+'&ifmatch='+encodeURIComponent(S.cloudSavedAt||'')+(force?'&force=1':'');
-    const r=await fetch(url,{method:'POST', body:JSON.stringify(S)});
+    const r=await fetch(hubUrl({mode:'cfgset', ifmatch:S.cloudSavedAt||'', force:force?'1':'0', device:navigator.platform||'web'}),
+                        {method:'POST', body:JSON.stringify(S)});
     const j=JSON.parse(await r.text());
-    if(j.error==='conflict'){
+    if(j.error==='conflict' || (j.ok===false && j.error==='conflict')){
       setSyncDot(false,'다른 기기가 더 최신 데이터를 올렸습니다 — 「클라우드에서 받기」 먼저');
       if(!silent) throw new Error('충돌 — 클라우드에 더 최신 데이터가 있습니다. 「클라우드에서 받기」로 먼저 확인하세요');
       return null;
     }
-    if(j.error==='bad token') throw new Error('동기화 암호가 스크립트의 TOKEN과 다릅니다');
-    if(j.error) throw new Error(j.error);
+    if(/토큰/.test(j.error||'')) throw new Error(j.error);
+    if(j.error && j.error!=='conflict') throw new Error(j.error);
     S.cloudSavedAt=j.savedAt; S.syncLinked=true; await Store.set(S);
     lastPushErr=''; setSyncDot(true,'클라우드 저장됨 '+new Date().toLocaleTimeString('ko-KR',{hour12:false}));
     return j;
@@ -1257,11 +1492,9 @@ async function cloudPull(){
   let j;
   try{ j=JSON.parse(await (await fetch(syncUrl('load'))).text()); }
   catch(e){ j=await jsonp(syncUrl('load'),12000); }     // CORS 차단 시 JSONP
-  if(j.error==='bad token') throw new Error('동기화 암호가 스크립트의 TOKEN과 다릅니다');
-  if(j.error) throw new Error(j.error);
-  if(j.empty) return {empty:true};
-  const st=JSON.parse(j.state);
-  return {state:st, savedAt:j.savedAt};
+  if(j.ok===false) throw new Error(j.error||'불러오기 실패');
+  if(!j.cfg || !j.cfg.data) return {empty:true};
+  return {state:JSON.parse(j.cfg.data), savedAt:j.cfg.at};
 }
 function setSyncDot(ok,msg){
   const el=$('#syncDot'); if(!el) return;
@@ -1400,6 +1633,13 @@ $$('.tab').forEach(t=> t.onclick=()=>{
   window.scrollTo({top:0,behavior:'instant'});
 });
 $('#btnSave').onclick=async()=>{ snapshot(true); await save(); toast('저장했습니다'); renderOverview(); };
+$('#btnTheme').onclick=()=>{
+  const order=['system','light','dark'];
+  S.theme=order[(order.indexOf(S.theme||'system')+1)%3];
+  try{ localStorage.setItem('lev2mode:theme', S.theme); }catch(e){}
+  window.__themeApply(S.theme); touch(); renderSet();
+  toast({system:'시스템 설정',light:'밝은 화면',dark:'어두운 화면'}[S.theme]);
+};
 $('#btnSync').onclick=async()=>{
   const fresh=await Store.get();
   if(fresh){ S=migrate(fresh); renderAll();
@@ -1407,16 +1647,28 @@ $('#btnSync').onclick=async()=>{
   else toast('저장된 데이터가 없습니다'); };
 $('#topDate').textContent=todayISO();
 
+async function unlockPrompt(){
+  const box=credBox(); if(!box) return;
+  for(let i=0;i<5;i++){
+    const pin=prompt(i? 'PIN이 올바르지 않습니다. 다시 입력하세요.' : 'PIN을 입력하세요.');
+    if(pin===null) return;
+    try{ Object.assign(S, await openCreds(pin, box)); return; }catch(e){}
+  }
+  toast('PIN 확인에 실패했습니다 — 설정에서 다시 입력하세요');
+}
+
 (async function init(){
   const loaded=await Store.get();
   if(loaded) S=migrate(loaded);
+  try{ const t=localStorage.getItem('lev2mode:theme'); if(t) S.theme=t; }catch(e){}
+  await unlockPrompt();
   renderAll();
   snapshot(false);
   if(syncReady()){
     try{
       const r=await cloudPull();
       if(r.state && (+r.state.savedAt||0) > (+S.savedAt||0)){
-        const keep={gsUrl:S.gsUrl, syncToken:S.syncToken, tdKey:S.tdKey};
+        const keep={gsUrl:S.gsUrl, gsToken:S.gsToken, tdKey:S.tdKey, theme:S.theme};
         S=migrate(r.state); Object.assign(S,keep);
         S.cloudSavedAt=r.savedAt; S.syncLinked=true;
         await Store.set(S); renderAll();
