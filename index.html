@@ -261,7 +261,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
-const APP_BUILD='v2026.08.03-1';
+const APP_BUILD='v2026.08.03-2';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -591,11 +591,33 @@ function engine(b){
    v(p) = (p ≤ 매수지정가 ? N : 0) − Σ(목표가 ≤ p 인 LOC 매도) − MOC 강제매도
 ------------------------------------------------------------ */
 function ladder(b,E){
-  const N   = E.buyQty;
-  const moc = E.lots.filter(l=>l.expired && l.held>=1).reduce((s,l)=>s+num(l.q),0);
-  const loc = E.lots.filter(l=>!l.expired && l.held>=1 && num(l.q)>0)
-                    .map(l=>({p:r2(l.sp), q:num(l.q)}));
-  // 임계가 = 각 LOC 매도 목표가 + (매수지정가+0.01)
+  const N = E.buyQty;
+  const mocLots = E.lots.filter(l=>l.expired && l.held>=1);
+  const locLots = E.lots.filter(l=>!l.expired && l.held>=1 && num(l.q)>0);
+  const moc = mocLots.reduce((s,l)=>s+num(l.q),0);
+  const loc = locLots.map(l=>({p:r2(l.sp), q:num(l.q)}));
+
+  /* 배분용 잔여 수량 원장.
+     기한도래(MOC) 로트는 어떤 가격에서도 청산 대상이므로 sp=0 으로 두어 항상 먼저 소진한다.
+     (매수와 상계되면 MOC 물량이 LOC 매도 행에 흡수되기 때문) */
+  const pool=[
+    ...mocLots.map(l=>({n:l.i+1, d:l.d, buy:num(l.p), sp:0,        q:num(l.q), rem:num(l.q), moc:true})),
+    ...locLots.map(l=>({n:l.i+1, d:l.d, buy:num(l.p), sp:r2(l.sp), q:num(l.q), rem:num(l.q), moc:false}))
+  ].sort((a,x)=> a.sp-x.sp || a.n-x.n);
+  /* 주문 수량을 로트에 배분. maxPrice 이하 목표가 로트만 대상. */
+  const alloc=(src, qty, maxPrice)=>{
+    let rem=qty; const out=[];
+    for(const c of src){
+      if(rem<=0) break;
+      if(maxPrice!=null && cents(c.sp)>cents(maxPrice)) continue;
+      if(c.rem<=0) continue;
+      const take=Math.min(rem, c.rem);
+      c.rem-=take; rem-=take;
+      out.push({n:c.n, d:c.d, buy:c.buy, take, partial:take<c.q});
+    }
+    return out;
+  };
+
   const setP = new Set(loc.map(l=>cents(l.p)));
   setP.add(cents(r2(E.buyLimit+0.01)));
   const th = Array.from(setP).sort((a,x)=>a-x).map(c=>c/100);
@@ -604,36 +626,45 @@ function ladder(b,E){
     for(const l of loc) if(cents(l.p) <= cents(p)) v -= l.q;
     return v;
   };
-  const v = [ V(th.length? th[0]-0.01 : 0) ];          // v0 : 최저가 구간
-  th.forEach(t=> v.push(V(t)));                        // v1..vm
+  const v = [ V(th.length? th[0]-0.01 : 0) ];
+  th.forEach(t=> v.push(V(t)));
   const P = x=>Math.max(0,x), M = x=>Math.max(0,-x);
   const rows=[];
-  const mocNet = P(v[v.length-1]) - M(v[0]);           // 항상 체결되는 기본 수량
-  if(mocNet<0) rows.push({side:'매도', type:'MOC 매도', qty:-mocNet, price:null,
-      cond:'종가 무조건 체결', memo:'기한도래 강제매도 순매도분'});
-  if(mocNet>0) rows.push({side:'매수', type:'MOC 매수', qty:mocNet, price:null,
-      cond:'종가 무조건 체결', memo:'상계 후 순매수분'});
+  const mocNet = P(v[v.length-1]) - M(v[0]);
+  if(mocNet<0) rows.push({side:'매도', kind:'MOC', qty:-mocNet, price:null,
+      cond:'종가 무조건 체결', memo:'기한도래 강제매도 순매도분',
+      lots:alloc(pool, -mocNet, null)});
+  if(mocNet>0) rows.push({side:'매수', kind:'MOC', qty:mocNet, price:null,
+      cond:'종가 무조건 체결', memo:'상계 후 순매수분', lots:[]});
   for(let j=1;j<v.length;j++){
-    const bq = P(v[j-1])-P(v[j]);                      // 매수 : 임계가 미만 구간
-    const sq = M(v[j])-M(v[j-1]);                      // 매도 : 임계가 이상 구간
+    const bq = P(v[j-1])-P(v[j]);
+    const sq = M(v[j])-M(v[j-1]);
     if(bq>0){ const lp=r2(th[j-1]-0.01);
-      rows.push({side:'매수',type:'LOC 매수',qty:bq,price:lp,
-        cond:`종가 ≤ ${fUSD(lp)} 시 체결`, memo:'상계 사다리 매수 (매일 재주문)'}); }
+      rows.push({side:'매수',kind:'LOC',qty:bq,price:lp,
+        cond:`종가 ≤ ${fUSD(lp)} 시 체결`, memo:'상계 사다리 매수 (매일 재주문)', lots:[]}); }
     if(sq>0){ const lp=th[j-1];
-      rows.push({side:'매도',type:'LOC 매도',qty:sq,price:lp,
-        cond:`종가 ≥ ${fUSD(lp)} 시 체결`, memo:'상계 사다리 매도 (매일 재주문)'}); }
+      rows.push({side:'매도',kind:'LOC',qty:sq,price:lp,
+        cond:`종가 ≥ ${fUSD(lp)} 시 체결`, memo:'상계 사다리 매도 (매일 재주문)',
+        lots:alloc(pool, sq, lp)}); }
   }
   rows.sort((a,x)=> (a.price??-1e9)-(x.price??-1e9));
+
+  // 로트 번호 → 오늘 걸린 주문 (원장 표에서 역참조)
+  const lotMap={};
+  rows.forEach(r=> (r.lots||[]).forEach(l=>{
+    (lotMap[l.n]=lotMap[l.n]||[]).push({kind:r.kind, price:r.price, take:l.take, partial:l.partial});
+  }));
+
   const buys = rows.filter(r=>r.side==='매수'), sells=rows.filter(r=>r.side==='매도');
   const maxBuy  = Math.max(...buys.map(r=>r.price??-Infinity), -Infinity);
   const minSell = Math.min(...sells.map(r=>r.price?? Infinity),  Infinity);
   return {
-    rows,
+    rows, lotMap,
     buyQty : buys.reduce((s,r)=>s+r.qty,0),
     sellQty: sells.reduce((s,r)=>s+r.qty,0),
     buyAmt : buys.reduce((s,r)=>s+r.qty*(r.price||0),0),
     overlap: maxBuy>=minSell,
-    saved  : Math.min(N, E.sellQty)*2*b.fee*(E.buyLimit||0)   // 상계로 아낀 왕복 수수료(근사)
+    saved  : Math.min(N, E.sellQty)*2*b.fee*(E.buyLimit||0)
   };
 }
 /* ============================================================
@@ -907,22 +938,28 @@ function renderBook(k){
   <div class="sec">
     <div class="sec-h"><span class="n">⑤</span><h2>보유 로트 원장</h2><span class="hint" style="${E.over?'color:var(--warn)':''}">${E.lots.length} / ${b.splits} 덩이${E.over?' (초과)':''}</span></div>
     <div class="card"><div class="tw"><table style="min-width:820px">
-      <thead><tr><th>#</th><th>매수일</th><th>매수가</th><th>수량</th><th>모드</th><th>목표매도가</th><th>경과</th><th>기한</th><th>주문 유형</th><th>오늘 매도</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>매수일</th><th>매수가</th><th>수량</th><th>모드</th><th>목표매도가</th><th>경과</th><th>기한</th><th>오늘 주문 (⑦ 연계)</th><th>매도 예정</th><th></th></tr></thead>
       <tbody>${E.lots.length? E.lots.map((l,i)=>`<tr>
-        <td>${i+1}</td>
+        <td style="font-weight:600">#${i+1}</td>
         <td><input data-l="${k}:${i}:d" type="date" value="${l.d||''}" style="width:132px"></td>
         <td><input data-l="${k}:${i}:p" value="${l.p}" style="width:82px;text-align:right"></td>
         <td><input data-l="${k}:${i}:q" value="${l.q}" style="width:62px;text-align:right"></td>
         <td><select data-l="${k}:${i}:mode" style="width:78px"><option ${l.mode==='공세'?'selected':''}>공세</option><option ${l.mode==='안전'?'selected':''}>안전</option></select></td>
         <td>${fUSD(l.sp)}</td><td>${l.held}일</td><td>${l.lim}일</td>
-        <td style="text-align:left;font-size:12px;color:${l.expired?'var(--bad)':'var(--tx2)'}">${esc(l.type)}</td>
-        <td class="${l.sell?(l.loss?'down':'up'):''}">${l.sell? l.sell+'주':'—'}</td>
+        <td style="text-align:left;font-size:12px">${(()=>{
+          const os=L.lotMap[l.i+1];
+          if(!os||!os.length) return '<span style="color:var(--tx3)">주문 없음</span>';
+          return os.map(o=>`<span style="color:var(--red)">${o.kind}</span>
+            <span style="color:var(--tx2)">${o.price!=null? fUSD(o.price):'종가'} · ${o.take}주${o.partial?' (일부)':''}</span>`).join('<br>');
+        })()}</td>
+        <td class="${l.sell?(l.loss?'down':'up'):''}">${l.sell? '−'+l.sell+'주':'—'}</td>
         <td><button class="btn sm dg" data-ldel="${k}:${i}">삭제</button></td></tr>`).join('')
         : `<tr><td colspan="11" class="empty">보유 로트가 없습니다</td></tr>`}</tbody>
     </table></div>
     <div class="btnrow"><button class="btn sm" data-ladd="${k}">로트 추가</button>
       <button class="btn sm g" data-lbuy="${k}">오늘 매수분 로트로 추가 (${E.buyQty}주)</button></div>
-    <div class="note">매도 체결 시 해당 행을 삭제하고, 신규 매수 체결 시 종가·수량으로 행을 추가하세요. 모드는 <b>매수 시점에 고정</b>됩니다.
+    <div class="note"><b>오늘 주문</b> 열은 ⑦ 상계 사다리에서 이 로트에 배정된 주문입니다. 상계로 수량이 줄면 <b>(일부)</b>로 표시됩니다.
+      매도 체결 시 해당 행을 삭제하고, 신규 매수 체결 시 종가·수량으로 행을 추가하세요. 모드는 <b>매수 시점에 고정</b>됩니다.
       로트 수는 분할 수를 넘을 수 있으며, 초과해도 매수는 차단되지 않습니다. 실제 투입 한도는 예수금이 결정합니다.</div>
     </div>
   </div>
@@ -932,14 +969,22 @@ function renderBook(k){
     <div class="sec-h"><span class="n">⑦</span><h2>오늘 목표 주문 (상계 사다리)</h2>
       <span class="hint">${L.overlap?'⚠ 지정가 겹침':'겹침 없음 ✓'}</span></div>
     <div class="card">
-      <div class="tw"><table style="min-width:700px">
-        <thead><tr><th>구분</th><th>주문 유형</th><th>수량</th><th>LOC 지정가</th><th>체결 조건</th></tr></thead>
+      <div class="tw"><table style="min-width:820px">
+        <thead><tr><th>구분</th><th>유형</th><th>수량</th><th>지정가</th><th>대상 로트</th><th>체결 조건</th></tr></thead>
         <tbody>${L.rows.length? L.rows.map(r=>`<tr>
           <td class="nm" style="color:${r.side==='매수'?'var(--green)':'var(--red)'}">${r.side}</td>
-          <td style="text-align:left">${esc(r.type)}</td>
-          <td>${r.qty}주</td><td>${r.price!=null? fUSD(r.price):'시장가(종가)'}</td>
+          <td style="text-align:left">${r.kind}</td>
+          <td style="color:${r.side==='매수'?'var(--green)':'var(--red)'};font-weight:600">${r.side==='매수'?'+':'−'}${r.qty}주</td>
+          <td>${r.price!=null? fUSD(r.price):'시장가(종가)'}</td>
+          <td style="text-align:left;font-size:12px">${
+            r.side==='매수' ? '<span style="color:var(--tx3)">신규 로트</span>'
+            : (r.lots&&r.lots.length)
+              ? r.lots.map(l=>`<span title="${esc(l.d)} 매수 · ${fUSD(l.buy)}" style="display:inline-block;border:1px solid var(--line);border-radius:5px;padding:1px 6px;margin:1px 3px 1px 0">
+                  #${l.n} <b>${l.take}주</b>${l.partial?' <span style="color:var(--warn)">일부</span>':''}
+                  <span style="color:var(--tx3)">· ${esc(String(l.d).slice(5))} @${fUSD(l.buy)}</span></span>`).join('')
+              : '<span style="color:var(--tx3)">—</span>'}</td>
           <td style="text-align:left;font-size:12px;color:var(--tx2)">${esc(r.cond)}</td></tr>`).join('')
-          : `<tr><td colspan="5" class="empty">오늘 낼 주문이 없습니다</td></tr>`}</tbody>
+          : `<tr><td colspan="6" class="empty">오늘 낼 주문이 없습니다</td></tr>`}</tbody>
       </table></div>
       <div class="dl" style="margin-top:14px">
         <dt>매수 주문 합계</dt><dd>${L.buyQty}주 · ${fUSD(L.buyAmt)}</dd>
