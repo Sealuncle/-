@@ -261,7 +261,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
-const APP_BUILD='v2026.08.03-2';
+const APP_BUILD='v2026.08.03-3';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -583,6 +583,35 @@ function engine(b){
 
   E.ladder = ladder(b,E);
   return E;
+}
+
+/* ── ⑧ 체결 정산 ────────────────────────────────────────
+   실제 종가를 넣으면 "원래 로직" 기준으로 원장·기록을 어떻게 정리할지 계산한다.
+   상계 사다리는 주문 방식일 뿐이고, 부기는 원래 로직을 따라야
+   목표수익률·보유기한이 전략 의도대로 다시 계산된다.
+
+   원래 로직:  종가 p 에서
+     · 매도 = 보유 1일 이상이면서 (기한도래 or 목표매도가 ≤ p) 인 로트 전량
+     · 매수 = p ≤ 매수지정가 이면 계획 수량 N
+     · 원장 = 매도된 로트 행 삭제 + 매수 체결 시 N주 신규 로트(종가·오늘 모드)
+   보유수량 증감은 N − S 로, 실제 상계 체결분과 정확히 일치한다. */
+function settle(b,E,close,dateISO){
+  const p=num(close), fee=num(b.fee);
+  const sells=E.lots.filter(l=> l.held>=1 && (l.expired || cents(l.sp)<=cents(p)))
+    .map(l=>({...l, gain:(p*(1-fee)-num(l.p)*(1+fee))*num(l.q), loss:p*(1-fee)<num(l.p)*(1+fee)}));
+  const S=sells.reduce((s,l)=>s+num(l.q),0);
+  const buyFills = E.buyQty>0 && cents(p)<=cents(E.buyLimit);
+  const N = buyFills? E.buyQty : 0;
+
+  // 매도일 매수금지 규칙을 실제 종가로 재판정 (계획 시점 예측과 다를 수 있음)
+  const rule=num(b.sellDayBuyRule), lossN=sells.filter(l=>l.loss).length;
+  const allowNow = rule===0 ? true : (sells.length===0 ? true : (rule===1 ? lossN>0 : lossN===sells.length));
+
+  return {p, d:dateISO, sells, S, N, buyFills, net:N-S, mode:E.mode,
+          proceeds:S*p, cost:N*p, cash:(S-N)*p,
+          realized:sells.reduce((s,l)=>s+l.gain,0),
+          ruleFlip: allowNow!==E.allowBuy, allowNow,
+          keepLots:(b.lots||[]).length - sells.length + (N>0?1:0)};
 }
 
 /* ── ⑦ 상계 사다리 ─────────────────────────────────────────
@@ -996,6 +1025,22 @@ function renderBook(k){
     </div>
   </div>
 
+  <!-- ⑧ 체결 정산 -->
+  <div class="sec">
+    <div class="sec-h"><span class="n">⑧</span><h2>체결 정산</h2><span class="hint">장 마감 후 원장 정리</span></div>
+    <div class="card">
+      <div class="fgrid c3">
+        <label class="f"><span class="l">체결 종가 ($)</span><input id="st-p-${k}" value="${E.prevClose||''}"></label>
+        <label class="f"><span class="l">거래일</span><input type="date" id="st-d-${k}" value="${E.session}"></label>
+        <label class="f"><span class="l">&nbsp;</span><button class="btn" data-stcalc="${k}" style="width:100%">정산 미리보기</button></label>
+      </div>
+      <div id="st-out-${k}"></div>
+      <div class="note">주문은 ⑦ 상계 사다리로 내되, <b>원장 부기는 원래 로직</b>을 따릅니다.
+        목표가에 도달한 로트는 삭제하고, 매수가 체결됐으면 계획 수량 전량을 종가로 신규 로트에 넣습니다.
+        보유수량 증감(N−S)은 실제 상계 체결분과 정확히 일치하므로 예수금·손익이 어긋나지 않습니다.</div>
+    </div>
+  </div>
+
   <!-- ⑥ 일별 매매 기록 -->
   <div class="sec">
     <div class="sec-h"><span class="n">⑥</span><h2>일별 매매 기록</h2><span class="hint">${(b.records||[]).length} 일</span></div>
@@ -1185,6 +1230,53 @@ function bindBook(k){
     });
     S.books[k].weekly = out.sort((a,c)=> a.d<c.d?-1:1); touch(); renderBook(k);
     toast(out.length+'주 반영 · 모드 재판정'); });
+  $$('[data-stcalc]',root).forEach(el=> el.onclick=()=>{
+    const p=num($('#st-p-'+k).value), d=$('#st-d-'+k).value||todayISO();
+    const box=$('#st-out-'+k);
+    if(!(p>0)) return box.innerHTML=`<div class="call warn" style="margin-top:12px">체결 종가를 입력하세요</div>`;
+    const r=settle(b, engine(b), p, d);
+    const dup=(b.records||[]).some(x=>x.d===d && !x.auto);
+    box.innerHTML = `
+      <div class="grid g2" style="margin-top:14px">
+        <div class="call ${r.N>0?'buy':'hold'}"><div class="hd">매수</div>
+          ${r.buyFills? `<b>${r.N}주</b> 체결 · ${fUSD(r.cost)}<br><span style="opacity:.8">종가 ${fUSD(p)} ≤ 지정가 ${fUSD(engine(b).buyLimit)}</span>`
+                      : `미체결 — 종가 ${fUSD(p)} > 지정가 ${fUSD(engine(b).buyLimit)}`}</div>
+        <div class="call ${r.S>0?'sell':'hold'}"><div class="hd">매도</div>
+          ${r.S>0? `<b>${r.S}주</b> 체결 · ${fUSD(r.proceeds)}<br><span style="opacity:.8">실현손익 ${fUSD(r.realized)}</span>`
+                 : '해당 로트 없음'}</div>
+      </div>
+      <div class="dl" style="margin-top:12px">
+        <dt>실제 순매매</dt><dd class="${r.net>0?'up':r.net<0?'down':''}">${r.net>0?'+':''}${r.net}주 · 현금 ${r.cash>=0?'+':''}${fUSD(r.cash)}</dd>
+        <dt>정리 후 로트</dt><dd>${(b.lots||[]).length}개 → ${r.keepLots}개</dd>
+      </div>
+      ${r.sells.length? `<div class="tw" style="margin-top:12px"><table style="min-width:520px">
+        <thead><tr><th>삭제할 로트</th><th>수량</th><th>매수가</th><th>사유</th><th>손익</th></tr></thead>
+        <tbody>${r.sells.map(l=>`<tr><td class="nm">#${l.i+1} <span style="color:var(--tx3);font-weight:400">${esc(l.d)}</span></td>
+          <td style="color:var(--red)">−${l.q}주</td><td>${fUSD(num(l.p))}</td>
+          <td style="text-align:left;font-size:12px">${l.expired?'기한 도래':'목표가 도달'}</td>
+          <td class="${l.loss?'down':'up'}">${fUSD(l.gain)}</td></tr>`).join('')}</tbody></table></div>`:''}
+      ${r.N>0? `<div class="call buy" style="margin-top:12px"><div class="hd">추가할 로트</div>
+        ${d} · <b>${r.N}주</b> @ ${fUSD(p)} · ${r.mode} 모드 · 목표 ${fUSD(p*(1+(r.mode==='안전'?b.safeTarget:b.aggrTarget)+(2+(r.mode==='안전'?b.safeTarget:b.aggrTarget))*b.fee))}</div>`:''}
+      ${r.ruleFlip? `<div class="call warn" style="margin-top:12px"><div class="hd">주의 — 매수금지 규칙 재판정</div>
+        실제 종가 기준으로는 매수가 <b>${r.allowNow?'허용':'금지'}</b>입니다. 주문은 전일 종가 기준으로 이미 냈으므로
+        계획 수량대로 반영합니다. 규칙을 엄격히 적용하려면 매수 부분을 수동으로 조정하세요.</div>`:''}
+      ${dup? `<div class="call warn" style="margin-top:12px">${d} 기록이 이미 있습니다. 반영하면 <b>덮어씁니다.</b></div>`:''}
+      <div class="btnrow"><button class="btn" data-stapply="${k}">원장·기록에 반영</button>
+        <button class="btn g" data-stclear="${k}">닫기</button></div>`;
+    box._r=r;
+    $$('[data-stapply]',box).forEach(x=> x.onclick=()=>{
+      const rr=box._r; const bb=S.books[k];
+      const del=new Set(rr.sells.map(l=>l.i));
+      bb.lots=(bb.lots||[]).filter((_,i)=>!del.has(i));
+      if(rr.N>0) bb.lots.push({d:rr.d, p:rr.p, q:rr.N, mode:rr.mode});
+      bb.records=(bb.records||[]).filter(x=>x.d!==rr.d);
+      bb.records.push({d:rr.d, close:rr.p, buy:rr.N, sell:rr.S});
+      bb.records.sort((a,c)=> a.d<c.d?-1:1);
+      touch(); renderBook(k);
+      toast(`정산 완료 · 매수 ${rr.N}주 / 매도 ${rr.S}주 반영`);
+    });
+    $$('[data-stclear]',box).forEach(x=> x.onclick=()=>{ box.innerHTML=''; });
+  });
   $$('[data-radd]',root).forEach(el=> el.onclick=()=>{
     const d=$('#rd-'+k).value, c=num($('#rc-'+k).value);
     if(!d||!c) return toast('날짜와 종가를 입력하세요');
