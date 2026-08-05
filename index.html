@@ -261,7 +261,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
-const APP_BUILD='v2026.08.03-3';
+const APP_BUILD='console-2.0.0-core1';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -278,6 +278,20 @@ const Store = {
     try { localStorage.setItem(KEY, s); } catch(e){}
     if (window.storage) { try { await window.storage.set(KEY, s); this.mode='cloud'; return true; } catch(e){ return false; } }
     return true;
+  },
+  /* 임의 키 접근 (백업용) */
+  async rawGet(k){
+    if (window.storage) { try { const r=await window.storage.get(k); if(r&&r.value!=null) return r.value; } catch(e){} }
+    try { return localStorage.getItem(k); } catch(e){ return null; }
+  },
+  async rawSet(k,v){
+    try { localStorage.setItem(k,v); } catch(e){}
+    if (window.storage) { try { await window.storage.set(k,v); } catch(e){} }
+    return true;
+  },
+  async rawDel(k){
+    try { localStorage.removeItem(k); } catch(e){}
+    if (window.storage) { try { await window.storage.delete(k); } catch(e){} }
   }
 };
 
@@ -371,6 +385,194 @@ function fKRW(v){
 }
 function toast(m){ const t=$('#toast'); t.textContent=m; t.classList.add('on'); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('on'),1800); }
 
+/* ════════════════════════════════════════════════════════════════
+   StrategyCore — 2모드 분할매매 공통 전략 엔진
+   콘솔과 백테스터에 "문자 단위로 동일하게" 삽입된다.
+   UI 렌더링과 원장 조작은 이 모듈 밖에서 한다.
+   ════════════════════════════════════════════════════════════════ */
+const StrategyCore = (() => {
+  'use strict';
+
+  const ENGINE_VERSION = '2mode-core-1.0.0';
+  const STRATEGY_SCHEMA_VERSION = 2;
+
+  const cents = v => Math.round(v * 100);
+
+  /* ── 매수 지정가 ─────────────────────────────────────────────
+     전략 조건: 종가 < 전일종가 × (1 + 매수제한률)  (엄격 부등식)
+     이 부등식을 만족하는 가장 높은 센트 가격을 지정가로 쓴다. */
+  function calcStrictBuyLimitCents(prevClose, rate) {
+    const rawCents = prevClose * (1 + rate) * 100;
+    return Math.ceil(rawCents - 1e-10) - 1;
+  }
+  function calcBuyLimit(prevClose, rate) {
+    return calcStrictBuyLimitCents(prevClose, rate) / 100;
+  }
+
+  /* ── 주문 수량 (지정가 기준 사전 확정) ─────────────────────
+     실제 종가가 지정가보다 낮아도 수량을 사후에 늘리지 않는다. */
+  function calcPlannedBuyQty(availableBuyBudget, buyLimit, buyFeeRate) {
+    if (!(buyLimit > 0) || !(availableBuyBudget > 0)) return 0;
+    return Math.floor(availableBuyBudget / (buyLimit * (1 + (buyFeeRate || 0))));
+  }
+
+  /* ── 목표가 ──────────────────────────────────────────────────
+     exact  : P×(1+buyFee)×(1+r)÷(1−sellFee), 조건 충족 최소 센트로 올림
+     legacy-approx : P×(1+r+(2+r)×f)  — 구 시트 호환(올림 없음) */
+  function calcTargetPrice(buyPrice, targetReturnRate, buyFeeRate, sellFeeRate, feeModel) {
+    if (feeModel === 'legacy-approx') {
+      const f = buyFeeRate;
+      return buyPrice * (1 + targetReturnRate + (2 + targetReturnRate) * f);
+    }
+    const raw = buyPrice * (1 + buyFeeRate) * (1 + targetReturnRate) / (1 - sellFeeRate);
+    return Math.ceil(raw * 100 - 1e-10) / 100;
+  }
+
+  /* ── VXN 4단계 ───────────────────────────────────────────── */
+  function classifyVxn(value, cfg) {
+    if (value === null || value === undefined || !isFinite(value)) {
+      return { stage: 'missing', multiplier: null, forceSafe: false };
+    }
+    if (value < cfg.vxnStableThreshold) {
+      return { stage: 'stable', multiplier: cfg.vxnStableMultiplier, forceSafe: false };
+    }
+    if (value < cfg.vxnCautionThreshold) {
+      return { stage: 'normal', multiplier: cfg.vxnNormalMultiplier, forceSafe: false };
+    }
+    if (value < cfg.vxnPanicThreshold) {
+      return { stage: 'caution', multiplier: cfg.vxnCautionMultiplier,
+               forceSafe: !!cfg.vxnForceSafeOnCaution };
+    }
+    return { stage: 'panic', multiplier: cfg.vxnPanicMultiplier,
+             forceSafe: !!cfg.vxnForceSafeOnPanic };
+  }
+  const VXN_STAGE_KO = { stable: '안정', normal: '보통', caution: '경계', panic: '패닉', missing: '데이터 없음' };
+
+  /* ── 유효 모드 ───────────────────────────────────────────────
+     baseMode('공세'|'안전'|'방어') 에 VXN 강제안전을 결합한다.
+     '방어'(위험필터)는 VXN보다 우선한다. */
+  function resolveEffectiveMode(baseMode, vxnStageInfo, vxnEnabled) {
+    if (!vxnEnabled || !vxnStageInfo) return baseMode;
+    if (baseMode === '방어') return baseMode;
+    if (vxnStageInfo.forceSafe) return '안전';
+    return baseMode;
+  }
+
+  /* ── 최종 매수 배수 ──────────────────────────────────────────
+     위험필터 배수 × VXN 배수. VXN 데이터 누락 시 null(매수 보류). */
+  function resolveBuyMultiplier(riskRatio, vxnStageInfo, vxnEnabled) {
+    const r = isFinite(riskRatio) ? riskRatio : 1;
+    if (!vxnEnabled) return r;
+    if (!vxnStageInfo || vxnStageInfo.stage === 'missing' || vxnStageInfo.multiplier === null) return null;
+    return r * vxnStageInfo.multiplier;
+  }
+
+  /* ── 매수 주문 평가 ──────────────────────────────────────────
+     ctx = { prevClose, buyCapRate, chunkAmount, cash, buyFeeRate,
+             multiplier(null=VXN누락), openLots, maxOpenLots(0=무제한),
+             blockedBySellRule(bool) }
+     반환 = { allowed, reason, limit, plannedQty, budget } */
+  function evaluateBuyOrder(ctx) {
+    const out = { allowed: false, reason: '', limit: null, plannedQty: 0, budget: 0 };
+    if (ctx.blockedBySellRule) { out.reason = 'SELL_DAY_RULE'; return out; }
+    if (ctx.multiplier === null) { out.reason = 'VXN_DATA_MISSING'; return out; }
+    if (ctx.multiplier <= 0) { out.reason = 'MULTIPLIER_ZERO'; return out; }
+    const cap = ctx.maxOpenLots > 0 ? ctx.maxOpenLots : Infinity;
+    if (ctx.openLots >= cap) { out.reason = 'MAX_OPEN_LOTS'; return out; }
+    if (!(ctx.prevClose > 0)) { out.reason = 'NO_PREV_CLOSE'; return out; }
+
+    const limit = calcBuyLimit(ctx.prevClose, ctx.buyCapRate);
+    const budget = Math.min(ctx.chunkAmount * ctx.multiplier, ctx.cash); // 차입 금지
+    const qty = calcPlannedBuyQty(budget, limit, ctx.buyFeeRate);
+    out.limit = limit; out.budget = budget; out.plannedQty = qty;
+    if (qty <= 0) { out.reason = 'INSUFFICIENT_CASH'; return out; }
+    out.allowed = true; out.reason = 'OK';
+    return out;
+  }
+
+  /* ── 매수 체결 판정 ────────────────────────────────────────── */
+  function isBuyFilled(actualClose, buyLimit) {
+    return cents(actualClose) <= cents(buyLimit);
+  }
+
+  /* ── 보유 세션 수 ────────────────────────────────────────────
+     완료된 거래 세션 인덱스 기준. 매수 세션 자체는 0으로 센다
+     (기존 콘솔·백테스터의 '매수 다음날부터' 규칙 유지). */
+  function calcHoldingSessions(currentSessionIndex, buySessionIndex) {
+    return currentSessionIndex - buySessionIndex;
+  }
+
+  /* ── 매도 평가 ───────────────────────────────────────────────
+     lot = { targetPrice, maxHoldSessions, buySessionIndex, qty }
+     반환 = { shouldSell, kind('TARGET'|'EXPIRE'|null), heldSessions }
+     실제 정산가는 항상 당일 종가다. */
+  function evaluateSellForLot(lot, actualClose, currentSessionIndex) {
+    const held = calcHoldingSessions(currentSessionIndex, lot.buySessionIndex);
+    if (held < 1) return { shouldSell: false, kind: null, heldSessions: held };
+    if (held >= lot.maxHoldSessions) return { shouldSell: true, kind: 'EXPIRE', heldSessions: held };
+    if (cents(actualClose) >= cents(lot.targetPrice)) {
+      return { shouldSell: true, kind: 'TARGET', heldSessions: held };
+    }
+    return { shouldSell: false, kind: null, heldSessions: held };
+  }
+  function evaluateSellOrders(lots, actualClose, currentSessionIndex) {
+    return (lots || []).map(l => Object.assign(
+      { lot: l }, evaluateSellForLot(l, actualClose, currentSessionIndex)));
+  }
+
+  /* ── 전략 설정 정규화·지문 ─────────────────────────────────── */
+  const STRATEGY_KEYS = [
+    'symbol', 'capital', 'splits', 'maxOpenLots',
+    'buyFeeRate', 'sellFeeRate', 'feeModel', 'feeNettingMode',
+    'quantityModel', 'buyLimitFormulaVersion',
+    'aggrTarget', 'aggrHold', 'safeTarget', 'safeHold',
+    'buyCap', 'sellDayBuyRule',
+    'rsiSource', 'rsiPeriod', 'rsiUpper', 'rsiLower', 'defaultMode',
+    'vxnEnabled', 'vxnModel', 'vxnSource',
+    'vxnStableThreshold', 'vxnCautionThreshold', 'vxnPanicThreshold',
+    'vxnStableMultiplier', 'vxnNormalMultiplier', 'vxnCautionMultiplier', 'vxnPanicMultiplier',
+    'vxnForceSafeOnCaution', 'vxnForceSafeOnPanic', 'vxnLagSessions',
+    'riskMaFilter', 'riskVolFilter', 'safeCut', 'safeCutRatio', 'defenseRatio',
+    'holidayCalendar'
+  ];
+  function canonicalizeStrategyConfig(cfg) {
+    const out = {
+      engineVersion: ENGINE_VERSION,
+      schemaVersion: STRATEGY_SCHEMA_VERSION
+    };
+    for (const k of STRATEGY_KEYS) {
+      let v = cfg[k];
+      if (v === undefined || v === null) v = null;
+      else if (typeof v === 'boolean') v = v ? 1 : 0;
+      else if (typeof v === 'number' && !isFinite(v)) v = null;
+      out[k] = v;
+    }
+    return out;
+  }
+  function stableStringify(obj) {
+    if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+    if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';
+    return '{' + Object.keys(obj).sort()
+      .map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+  }
+  async function hashStrategyConfig(cfg) {
+    const canon = canonicalizeStrategyConfig(cfg);
+    const text = stableStringify(canon);
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    const hex = [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+    return { hash: hex, short: hex.slice(0, 8), canonical: canon, text };
+  }
+
+  return {
+    ENGINE_VERSION, STRATEGY_SCHEMA_VERSION, VXN_STAGE_KO, STRATEGY_KEYS,
+    cents, calcStrictBuyLimitCents, calcBuyLimit, calcPlannedBuyQty,
+    calcTargetPrice, classifyVxn, resolveEffectiveMode, resolveBuyMultiplier,
+    evaluateBuyOrder, isBuyFilled, calcHoldingSessions,
+    evaluateSellForLot, evaluateSellOrders,
+    canonicalizeStrategyConfig, stableStringify, hashStrategyConfig
+  };
+})();
+
 /* ============================================================
    3. 상태 (구글시트 기본값 이식)
    ============================================================ */
@@ -384,6 +586,7 @@ function newBook(o){
     safeTarget:0.01, safeDays:35,
     buyLimitPct:0.04,
     baseMode:'공세', manualMode:'자동', useRSI:true,
+    opMode:'ACTIVE',                       // ACTIVE | BUY_PAUSED | EXIT_ONLY
     sellDayBuyRule:2,
     riskState:'정상', riskRatio:1, safeCut:false, safeCutRatio:0.5,
     vxnOn:false, vxnCalm:20, vxnWarn:28, vxnPanic:36,
@@ -420,6 +623,78 @@ async function save(){
 }
 let saveTimer=null;
 function touch(){ clearTimeout(saveTimer); saveTimer=setTimeout(save,400); }
+
+/* ============================================================
+   3-2. 자동 백업 · 로트 계약 · 세션 계산
+   ============================================================ */
+const CONTRACT_MIGRATION_ID = 'contract-1';
+
+/** 부팅 시 하루 1회 상태 스냅샷. 마이그레이션·정산 사고로부터 복구 지점 확보 */
+async function backupState(tag){
+  try{
+    const key='lev2mode:backup:'+(tag||todayISO());
+    const listKey='lev2mode:backup:list';
+    if(await Store.rawGet?.(key)) return;                       // 이미 있음
+    await Store.rawSet?.(key, JSON.stringify({at:Date.now(), state:S}));
+    let list=[]; try{ list=JSON.parse(await Store.rawGet?.(listKey)||'[]'); }catch(e){}
+    list=list.filter(k=>k!==key); list.push(key);
+    while(list.length>7){ const old=list.shift(); try{ await Store.rawDel?.(old); }catch(e){} }
+    await Store.rawSet?.(listKey, JSON.stringify(list));
+  }catch(e){ console.warn('백업 실패(치명적 아님):', e.message); }
+}
+
+/** 목표가·기한을 매수 시점 계약으로 로트에 고정한다.
+    - 기존 로트: 마이그레이션 시점의 현행 설정값으로 1회 스탬프 (동작 변화 없음, 이후 소급 변동 종료)
+    - 신규 로트: stampNewLot() 이 정확식으로 스탬프
+    - 멱등: ct 가 이미 있으면 건드리지 않는다 */
+function migrateContracts(){
+  let n=0;
+  for(const k of Object.keys(S.books||{})){
+    const b=S.books[k]; if(!b) continue;
+    (b.lots||[]).forEach(l=>{
+      if(!l || !l.d || l.ct) return;
+      const t = l.mode==='안전'? num(b.safeTarget) : num(b.aggrTarget);
+      l.ct = {
+        tp  : r2(num(l.p)*(1+t+(2+t)*num(b.fee))),          // 현행(근사식) 값 그대로 고정
+        hold: l.mode==='안전'? num(b.safeDays) : num(b.aggrDays),
+        fm  : 'legacy-approx',
+        ev  : StrategyCore.ENGINE_VERSION,
+        contractMigrated:true, contractSource:'legacy-current-settings'
+      };
+      n++;
+    });
+    b.contractMigrationId = CONTRACT_MIGRATION_ID;
+  }
+  return n;
+}
+
+/** 신규 로트 계약 스탬프 (정확식) */
+function stampNewLot(b, lot){
+  const t = lot.mode==='안전'? num(b.safeTarget) : num(b.aggrTarget);
+  lot.ct = {
+    tp  : StrategyCore.calcTargetPrice(num(lot.p), t, num(b.fee), num(b.fee), 'exact'),
+    hold: lot.mode==='안전'? num(b.safeDays) : num(b.aggrDays),
+    fm  : 'exact',
+    ev  : StrategyCore.ENGINE_VERSION
+  };
+  return lot;
+}
+function lotTarget(b,l){ return l.ct? num(l.ct.tp) : r2(num(l.p)*(1+(l.mode==='안전'?num(b.safeTarget):num(b.aggrTarget))*1)+0); }
+function lotHoldLimit(b,l){ return l.ct? num(l.ct.hold) : (l.mode==='안전'? num(b.safeDays):num(b.aggrDays)); }
+
+/** 보유 세션 수: ⑥ 일별 기록의 실제 세션(종가 존재일)으로 센다.
+    기록이 성긴 경우 주말제외 근사(networkDays)로 보수 폴백하고 경고 플래그를 준다. */
+function heldSessions(b, lotDateISO, cutoffISO){
+  const nd = Math.max(0, networkDays(D(lotDateISO), D(cutoffISO)) - 1);
+  const recDays = new Set((b.records||[])
+    .filter(r=> r.d && num(r.close)>0 && r.d>lotDateISO && r.d<=cutoffISO)
+    .map(r=> r.d));
+  const sess = recDays.size;
+  if(sess===0 && nd>0) return {held:nd, src:'networkDays', gap:nd};
+  const gap = Math.max(0, nd - sess);
+  return {held:sess, src:'records', gap};
+}
+
 
 /* ============================================================
    4. 주간 RSI → 모드 판정  (QQQ주간RSI 시트 수식 이식)
@@ -475,15 +750,16 @@ function vxnState(b){
   if(!last) return {on:true,  level:'데이터 없음', ratio:null, forceSafe:false, last:null, prev:null, stale:null,
                     warn:'VXN 시계열이 없습니다 — 시세 갱신에서 VXN을 받아오거나 직접 입력하세요'};
   const v=num(last.c);
-  let level,ratio;
-  if(v < num(b.vxnCalm))       { level='안정'; ratio=num(b.vxnCalmRatio); }
-  else if(v < num(b.vxnWarn))  { level='보통'; ratio=num(b.vxnNormRatio); }
-  else if(v < num(b.vxnPanic)) { level='경계'; ratio=num(b.vxnWarnRatio); }
-  else                         { level='패닉'; ratio=num(b.vxnPanicRatio); }
+  const cls=StrategyCore.classifyVxn(v,{
+    vxnStableThreshold:num(b.vxnCalm), vxnCautionThreshold:num(b.vxnWarn), vxnPanicThreshold:num(b.vxnPanic),
+    vxnStableMultiplier:num(b.vxnCalmRatio), vxnNormalMultiplier:num(b.vxnNormRatio),
+    vxnCautionMultiplier:num(b.vxnWarnRatio), vxnPanicMultiplier:num(b.vxnPanicRatio),
+    vxnForceSafeOnCaution:!!b.vxnForceSafe, vxnForceSafeOnPanic:!!b.vxnForceSafe});
+  const level=StrategyCore.VXN_STAGE_KO[cls.stage], ratio=cls.multiplier;
   const stale=Math.max(0, networkDays(D(last.d), D(cut))-1);
-  return {on:true, level, ratio, v, last, prev,
+  return {on:true, level, ratio, v, last, prev, stage:cls.stage,
           chg: prev? v-num(prev.c) : null, stale,
-          forceSafe: !!b.vxnForceSafe && (level==='경계'||level==='패닉'),
+          forceSafe: cls.forceSafe,
           warn: stale>=2? `VXN 기록이 ${stale}거래일 오래됐습니다`:''};
 }
 
@@ -491,10 +767,20 @@ function engine(b){
   const fx = S.fx||1;
   const E = {};
   E.seedUSD   = b.seedKRW/fx + b.seedUSD;                 // E4 총 최초 투자금($)
-  E.bought    = (b.records||[]).reduce((s,r)=> s+num(r.buy)*num(r.close),0);   // E5
-  E.sold      = (b.records||[]).reduce((s,r)=> s+num(r.sell)*num(r.close),0);  // E6
-  E.qty       = (b.records||[]).reduce((s,r)=> s+num(r.buy)-num(r.sell),0);    // E7
-  E.cash      = E.seedUSD - E.bought + E.sold;            // E8 예수금
+  // ── 실현금 회계: 수수료 반영 + 당일 상계 절감(왕복수수료 환급) + 실체결 단가(bp/sp) 지원
+  const feeR = num(b.fee);
+  E.bought=0; E.sold=0; E.qty=0; E.feeSaved=0;
+  (b.records||[]).forEach(r=>{
+    const bq=num(r.buy), sq=num(r.sell), cl=num(r.close);
+    const bpx=num(r.bp)>0? num(r.bp) : cl;                 // 실 매수단가 (없으면 종가)
+    const spx=num(r.sp)>0? num(r.sp) : cl;                 // 실 매도단가 (없으면 종가)
+    E.bought += bq*bpx*(1+feeR);
+    E.sold   += sq*spx*(1-feeR);
+    const off = 2*feeR*cl*Math.min(bq,sq);                 // 상계 사다리 왕복수수료 절감
+    E.feeSaved += off;
+    E.qty    += bq - sq;
+  });
+  E.cash      = E.seedUSD - E.bought + E.sold + E.feeSaved;   // E8 예수금 (수수료 반영)
   E.evalUSD   = E.qty * num(b.price);                     // E9
   E.totalUSD  = E.cash + E.evalUSD;                       // E10
   E.totalKRW  = E.totalUSD * fx;                          // E11
@@ -539,19 +825,22 @@ function engine(b){
   if(E.vxn.on && E.vxn.ratio!=null) ratio = ratio * E.vxn.ratio;   // VXN 배수 적용
   E.ratio = ratio;
 
-  // ⑤ 로트 원장
-  const td = D(todayISO());
+  // ⑤ 로트 원장 — 계약(ct) 고정값 우선, 보유일은 기록 세션 기준
+  E.sessGapWarn = 0;
   E.lots = (b.lots||[]).filter(l=>l.d).map((l,i)=>{
-    const t   = l.mode==='안전'? b.safeTarget : b.aggrTarget;
-    const sp  = num(l.p)*(1+t+(2+t)*b.fee);                     // F 목표매도가
-    const held= Math.max(0, networkDays(D(l.d), td)-1);          // G 보유경과
-    const lim = l.mode==='안전'? b.safeDays : b.aggrDays;        // H 기한
+    const sp  = l.ct? num(l.ct.tp)
+                    : r2(num(l.p)*(1+(l.mode==='안전'?num(b.safeTarget):num(b.aggrTarget))
+                        +(2+(l.mode==='안전'?num(b.safeTarget):num(b.aggrTarget)))*num(b.fee)));
+    const hs  = heldSessions(b, l.d, E.cutoff);
+    const held= hs.held;
+    if(hs.src==='records' && hs.gap>=3) E.sessGapWarn++;
+    const lim = l.ct? num(l.ct.hold) : (l.mode==='안전'? num(b.safeDays) : num(b.aggrDays));
     const expired = held>=lim;
     let sell=0;
-    if(held>=1) sell = expired? num(l.q) : (E.prevClose>=sp? num(l.q):0);   // J
-    const fill = sell? (expired? E.prevClose : sp) : null;                  // K
-    const loss = sell>0 && (fill*(1-b.fee) < num(l.p)*(1+b.fee));
-    return {i, ...l, sp:r2(sp), held, lim, expired, sell, fill, loss,
+    if(held>=1) sell = expired? num(l.q) : (E.prevClose>=sp? num(l.q):0);   // J (전일종가 기준 예상)
+    const fill = sell? (expired? E.prevClose : sp) : null;                  // K 최소 예상 체결가 — 정산은 실제 종가
+    const loss = sell>0 && (fill*(1-num(b.fee)) < num(l.p)*(1+num(b.fee)));
+    return {i, ...l, sp:r2(sp), held, lim, expired, sell, fill, loss, heldSrc:hs.src,
             type: expired?'MOC 강제매도':'LOC 익절 @'+fUSD(sp)};
   });
   E.sellLots  = E.lots.filter(l=>l.sell>0).length;              // E37
@@ -566,20 +855,31 @@ function engine(b){
     ? (rule===0?'허용 (규칙 미적용)': E.sellLots===0?'허용 (오늘 매도 없음)': rule===1?'허용 (손실 매도 포함)':'허용 (전부 손실 매도)')
     : (rule===1?'금지 (이익 매도만 있음)':'금지 (이익 매도 포함)');
 
-  // ④ 오늘 주문
-  E.buyLimit = r2(r2(E.prevClose*(1+b.buyLimitPct)) - 0.01);   // D40
-  E.full = E.lots.length >= b.splits;      // 표시용 — 매수 차단 조건에서는 제외
+  // ④ 오늘 주문 — StrategyCore 표준 (엄격 센트 지정가 · 지정가 기준 사전 수량 · 차입 금지)
+  E.opMode = b.opMode || 'ACTIVE';
+  E.buyLimit = E.prevClose>0 ? StrategyCore.calcBuyLimit(E.prevClose, num(b.buyLimitPct)) : 0;
+  E.full = E.lots.length >= b.splits;      // 표시용 — 분할 수는 1덩이 금액 기준일 뿐 (매수 차단 안 함)
   E.over = E.lots.length > b.splits;
-  E.buyQty = (!E.allowBuy || E.buyLimit<=0) ? 0
-           : Math.floor(Math.min(E.chunk*ratio, E.cash)*(1-b.fee)/E.buyLimit);   // B40
+  const vxnMissing = E.vxn.on && E.vxn.ratio==null;
+  E.buyEval = StrategyCore.evaluateBuyOrder({
+    prevClose:E.prevClose, buyCapRate:num(b.buyLimitPct),
+    chunkAmount:E.chunk, cash:Math.max(0,E.cash), buyFeeRate:num(b.fee),
+    multiplier: vxnMissing? null : ratio,
+    openLots:E.lots.length, maxOpenLots:0,
+    blockedBySellRule: !E.allowBuy
+  });
+  const opBlocked = E.opMode!=='ACTIVE';
+  E.buyQty = (opBlocked || !E.buyEval.allowed) ? 0 : E.buyEval.plannedQty;
   E.buyAmt = E.buyQty*E.buyLimit;
 
-  E.buyMsg = !E.allowBuy ? '매수 금지 — 매도일 매수금지 규칙'
-           : ratio===0 ? (E.vxn.on && E.vxn.level==='패닉' ? ' 신규매수 중단 — VXN 패닉 구간' : '신규매수 중단 — 위험필터 방어 상태')
-           : E.buyQty===0 ? '수량 0 — 예수금 부족 또는 매수비율 축소'
+  E.buyMsg = opBlocked ? (E.opMode==='EXIT_ONLY' ? '신규매수 중단 — 기존 로트 청산 대기' : '신규매수 일시중단 — 운용 설정')
+           : E.buyEval.reason==='SELL_DAY_RULE' ? '매수 금지 — 매도일 매수금지 규칙'
+           : E.buyEval.reason==='VXN_DATA_MISSING' ? '매수 보류 — 직전 세션 VXN 데이터 없음 (매도 관리는 정상)'
+           : E.buyEval.reason==='MULTIPLIER_ZERO' ? (E.vxn.on && E.vxn.level==='패닉' ? '신규매수 중단 — VXN 패닉 구간' : '신규매수 중단 — 위험필터 방어 상태')
+           : E.buyEval.reason==='INSUFFICIENT_CASH' ? '수량 0 — 예수금 부족 또는 매수비율 축소'
            : `LOC 매수 ${E.buyQty}주 @ ${fUSD(E.buyLimit)}`
              + (ratio!==1?` · 투입액 ${Math.round(ratio*100)}% 적용`:'')
-             + (E.over?` · 보유 덩이 ${E.lots.length}/${b.splits} 초과`:'');
+             + (E.over?` · 보유 덩이 ${E.lots.length}/${b.splits} 초과 (재투자 복리)`:'');
 
   E.ladder = ladder(b,E);
   return E;
@@ -598,9 +898,10 @@ function engine(b){
 function settle(b,E,close,dateISO){
   const p=num(close), fee=num(b.fee);
   const sells=E.lots.filter(l=> l.held>=1 && (l.expired || cents(l.sp)<=cents(p)))
-    .map(l=>({...l, gain:(p*(1-fee)-num(l.p)*(1+fee))*num(l.q), loss:p*(1-fee)<num(l.p)*(1+fee)}));
+    .map(l=>({...l, planSell:num(l.q), actSell:num(l.q),
+              gain:(p*(1-fee)-num(l.p)*(1+fee))*num(l.q), loss:p*(1-fee)<num(l.p)*(1+fee)}));
   const S=sells.reduce((s,l)=>s+num(l.q),0);
-  const buyFills = E.buyQty>0 && cents(p)<=cents(E.buyLimit);
+  const buyFills = E.buyQty>0 && StrategyCore.isBuyFilled(p, E.buyLimit);
   const N = buyFills? E.buyQty : 0;
 
   // 매도일 매수금지 규칙을 실제 종가로 재판정 (계획 시점 예측과 다를 수 있음)
@@ -619,6 +920,92 @@ function settle(b,E,close,dateISO){
         매수·매도 지정가가 겹치지 않도록 재배치 (자전거래 방지).
    v(p) = (p ≤ 매수지정가 ? N : 0) − Σ(목표가 ≤ p 인 LOC 매도) − MOC 강제매도
 ------------------------------------------------------------ */
+/* ── 전략 지문·검증본 (P0-배지) ─────────────────────────────
+   백테스터 strategyConfigOf 와 동일한 키 구성으로 콘솔 북을 매핑한다.
+   콘솔에 없는 백테스터 전용 필드는 표준값으로 고정한다. */
+function strategyConfigOfBook(b, E){
+  return {
+    symbol: b.ticker,
+    capital: Math.round(E ? E.seedUSD : (num(b.seedKRW)/(S.fx||1)+num(b.seedUSD))),
+    splits: num(b.splits), maxOpenLots: 0,
+    buyFeeRate: num(b.fee), sellFeeRate: num(b.fee),
+    feeModel: 'exact', feeNettingMode: 'legacy-overlap-netting',
+    quantityModel: 'order-limit-price', buyLimitFormulaVersion: 'strict-cents-1',
+    aggrTarget: num(b.aggrTarget), aggrHold: num(b.aggrDays),
+    safeTarget: num(b.safeTarget), safeHold: num(b.safeDays),
+    buyCap: num(b.buyLimitPct), sellDayBuyRule: num(b.sellDayBuyRule),
+    rsiSource: b.rsiSource, rsiPeriod: num(b.rsiPeriod),
+    rsiUpper: num(b.rsiUpper), rsiLower: num(b.rsiLower),
+    defaultMode: b.baseMode,
+    vxnEnabled: !!b.vxnOn, vxnModel: 'four-stage', vxnSource: 'index',
+    vxnStableThreshold: num(b.vxnCalm), vxnCautionThreshold: num(b.vxnWarn), vxnPanicThreshold: num(b.vxnPanic),
+    vxnStableMultiplier: num(b.vxnCalmRatio), vxnNormalMultiplier: num(b.vxnNormRatio),
+    vxnCautionMultiplier: num(b.vxnWarnRatio), vxnPanicMultiplier: num(b.vxnPanicRatio),
+    vxnForceSafeOnCaution: !!b.vxnForceSafe, vxnForceSafeOnPanic: !!b.vxnForceSafe,
+    vxnLagSessions: 1,
+    riskMaFilter: false, riskVolFilter: false,
+    safeCut: !!b.safeCut, safeCutRatio: num(b.safeCutRatio), defenseRatio: 0,
+    holidayCalendar: 'actual-market-sessions'
+  };
+}
+const FP_CACHE = {};   // k → {short, at}
+async function refreshBookFingerprint(k){
+  try{
+    const b=S.books[k]; if(!b||typeof StrategyCore==='undefined') return;
+    const h=await StrategyCore.hashStrategyConfig(strategyConfigOfBook(b, engine(b)));
+    FP_CACHE[k]={short:h.short, hash:h.hash};
+    const el=document.querySelector('#fp-'+k.toLowerCase());
+    if(el){
+      const rel=b.appliedRelease||null;
+      const match = rel && rel.strategyHashShort===h.short;
+      el.innerHTML = rel
+        ? (match? `검증 전략 <b>${h.short}</b> · 일치`
+                : `현재 설정 <b>${h.short}</b> · <span style="color:var(--warn)">검증본 ${rel.strategyHashShort}와 다름 (미검증)</span>`)
+        : `현재 설정 <b>${h.short}</b> · <span style="color:var(--tx3)">적용된 검증본 없음</span>`;
+    }
+  }catch(e){}
+}
+async function loadRelease(k){
+  if(!syncReady()){ toast('설정 탭에서 구글시트 연동을 먼저 완료하세요'); return; }
+  try{
+    const r=await hubGet(hubUrl({mode:'slotget', slot:'verified_release:'+k}));
+    if(!r || !r.entry || !r.entry.data) throw new Error('시트에 '+k+' 검증본이 없습니다 — 백테스터에서 [검증본으로 확정]을 먼저 실행하세요');
+    const rel=JSON.parse(r.entry.data);
+    const b=S.books[k], p=rel.parameters||{};
+    const map=[['aggrTarget','aggrTarget'],['aggrHold','aggrDays'],['safeTarget','safeTarget'],['safeHold','safeDays'],
+      ['buyCap','buyLimitPct'],['sellDayBuyRule','sellDayBuyRule'],['splits','splits'],
+      ['rsiPeriod','rsiPeriod'],['rsiUpper','rsiUpper'],['rsiLower','rsiLower'],
+      ['vxnStableThreshold','vxnCalm'],['vxnCautionThreshold','vxnWarn'],['vxnPanicThreshold','vxnPanic'],
+      ['vxnStableMultiplier','vxnCalmRatio'],['vxnNormalMultiplier','vxnNormRatio'],
+      ['vxnCautionMultiplier','vxnWarnRatio'],['vxnPanicMultiplier','vxnPanicRatio']];
+    const diffs=[];
+    for(const [pk,bk] of map){
+      if(p[pk]===undefined||p[pk]===null) continue;
+      const cur=num(b[bk]), nv=num(p[pk]);
+      if(Math.abs(cur-nv)>1e-12) diffs.push(`${bk}: ${cur} → ${nv}`);
+    }
+    let vxnDiff=null;
+    if(p.vxnEnabled!==undefined && (!!p.vxnEnabled)!==(!!b.vxnOn)) vxnDiff=`vxnOn: ${!!b.vxnOn} → ${!!p.vxnEnabled}`;
+    if(vxnDiff) diffs.push(vxnDiff);
+    const head=`검증본 ${rel.strategyHashShort} (${(rel.verifiedAt||'').slice(0,10)} · ${rel.dataStart||''}~${rel.dataThrough||''})\n`
+      +(rel.results? `백테스트: CAGR ${(rel.results.cagr*100).toFixed(1)}% · MDD ${(rel.results.mdd*100).toFixed(1)}%\n`:'');
+    if(!diffs.length){
+      b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
+      await Store.set(S); renderAll();
+      toast('검증본과 현재 설정이 이미 일치합니다 — 적용 표시만 갱신');
+      auditNote(b,'release-apply','일치 '+rel.strategyHashShort);
+      return;
+    }
+    if(!confirm(head+'\n변경될 파라미터 (신규 로트부터 적용, 기존 로트 계약은 불변):\n'+diffs.join('\n')+'\n\n적용할까요?')) return;
+    for(const [pk,bk] of map){ if(p[pk]!==undefined&&p[pk]!==null) b[bk]=num(p[pk]); }
+    if(p.vxnEnabled!==undefined) b.vxnOn=!!p.vxnEnabled;
+    b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
+    await Store.set(S); renderAll();
+    toast('검증본 '+rel.strategyHashShort+' 적용 — 신규 로트부터 새 조건으로 매수합니다');
+    auditNote(b,'release-apply',rel.releaseId+' 변경 '+diffs.length+'건');
+  }catch(e){ toast('검증본 불러오기 실패: '+(e.message||e)); }
+}
+
 function ladder(b,E){
   const N = E.buyQty;
   const mocLots = E.lots.filter(l=>l.expired && l.held>=1);
@@ -903,6 +1290,12 @@ function renderBook(k){
   $('#p-'+k.toLowerCase()).innerHTML = `
   <div class="eyebrow"><span>${k} · 2-Mode LOC Trading</span><span>${todayISO()}</span></div>
   <h1>${k} 2모드 매매</h1>
+  <div class="note" style="display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;margin:6px 0 2px">
+    <span id="fp-${k.toLowerCase()}" class="mono" style="font-size:12px">지문 계산 중…</span>
+    <span style="font-size:12px">운용 상태: <b>${E.opMode==='ACTIVE'?'정상 운용':E.opMode==='BUY_PAUSED'?'신규매수 일시중단':'기존 로트 청산 대기'}</b>${b.manualMode!=='자동'?' · <span style="color:var(--warn)">수동 모드 고정</span>':''}</span>
+    <span style="font-size:12px;color:var(--tx3)">원장 최종 정산: ${(b.records&&b.records.length)? b.records[b.records.length-1].d : '없음'} · 계약고정 ${(b.lots||[]).filter(l=>l.ct).length}/${(b.lots||[]).length}로트</span>
+    <button class="mini" data-relload="${k}" style="font-size:11.5px">검증본 불러오기</button>
+  </div>
   <p class="sub">${b.rsiSource} 주간 RSI로 공세·안전 모드를 판정하고, 시드 분할 · LOC 종가매매로 1덩이씩 매수합니다.</p>
 
   <!-- ④ 오늘 주문 : 가장 먼저 보이도록 상단 배치 -->
@@ -1062,7 +1455,22 @@ function renderBook(k){
 
   <!-- ② 전략 파라미터 -->
   <div class="sec">
-    <div class="sec-h"><span class="n">②</span><h2>전략 파라미터</h2></div>
+    <div class="sec-h"><span class="n">②</span><h2>전략 파라미터</h2>
+      <span class="hint" id="fp-${k}" style="font-family:var(--mono)"></span></div>
+    <div class="card" style="margin-bottom:12px">
+      <div class="fgrid c3">
+        <label class="f"><span class="l">운용 상태</span>
+          <select data-b="${k}:opMode">
+            <option value="ACTIVE" ${(b.opMode||'ACTIVE')==='ACTIVE'?'selected':''}>정상 운용 (매수·매도)</option>
+            <option value="BUY_PAUSED" ${b.opMode==='BUY_PAUSED'?'selected':''}>신규매수 일시중단</option>
+            <option value="EXIT_ONLY" ${b.opMode==='EXIT_ONLY'?'selected':''}>기존 로트 청산 대기 (매도만 진행)</option>
+          </select></label>
+        <label class="f"><span class="l">검증본 (백테스터에서 발행)</span>
+          <button class="btn g" data-relget="${k}" style="width:100%">검증본 확인·적용</button></label>
+        <label class="f"><span class="l">&nbsp;</span><span class="hint" id="rel-${k}" style="padding-top:8px"></span></label>
+      </div>
+      ${b.opMode==='EXIT_ONLY' ? '<div class="note" style="color:var(--warn,orange)">기존 로트 청산 대기 — 신규매수 제안이 표시되지 않습니다. 보유 로트의 목표가·기한 매도는 계약대로 계속 관리됩니다.</div>':''}
+    </div>
     <div class="card"><div class="fgrid c3">
       ${fld(k+':splits','분할 수 (덩이)',b.splits)}
       ${fld(k+':fee','매매 수수료 (0.0025=0.25%)',b.fee)}
@@ -1203,13 +1611,15 @@ function bindBook(k){
     const [bk,i,f]=el.dataset.l.split(':');
     S.books[bk].lots[+i][f] = (f==='d'||f==='mode')? el.value : num(el.value);
     touch(); renderBook(bk); });
+  $$('[data-relload]',root).forEach(el=> el.onclick=()=> loadRelease(el.dataset.relload));
+  refreshBookFingerprint(k);
   $$('[data-ldel]',root).forEach(el=> el.onclick=()=>{
     const [bk,i]=el.dataset.ldel.split(':'); S.books[bk].lots.splice(+i,1); touch(); renderBook(bk); });
   $$('[data-ladd]',root).forEach(el=> el.onclick=()=>{
-    S.books[k].lots.push({d:todayISO(), p:engine(b).prevClose, q:0, mode:engine(b).mode}); touch(); renderBook(k); });
+    S.books[k].lots.push(stampNewLot(S.books[k],{d:todayISO(), p:engine(b).prevClose, q:0, mode:engine(b).mode})); touch(); renderBook(k); });
   $$('[data-lbuy]',root).forEach(el=> el.onclick=()=>{
     const E=engine(b); if(!E.buyQty) return toast('오늘 매수 수량이 0입니다');
-    S.books[k].lots.push({d:todayISO(), p:E.prevClose, q:E.buyQty, mode:E.mode});
+    S.books[k].lots.push(stampNewLot(S.books[k],{d:todayISO(), p:E.prevClose, q:E.buyQty, mode:E.mode}));
     S.books[k].records.push({d:todayISO(), close:E.prevClose, buy:E.buyQty, sell:0});
     touch(); renderBook(k); toast('로트와 기록에 추가했습니다'); });
   $$('[data-vx]',root).forEach(el=> el.onclick=()=>{
@@ -1261,19 +1671,54 @@ function bindBook(k){
         실제 종가 기준으로는 매수가 <b>${r.allowNow?'허용':'금지'}</b>입니다. 주문은 전일 종가 기준으로 이미 냈으므로
         계획 수량대로 반영합니다. 규칙을 엄격히 적용하려면 매수 부분을 수동으로 조정하세요.</div>`:''}
       ${dup? `<div class="call warn" style="margin-top:12px">${d} 기록이 이미 있습니다. 반영하면 <b>덮어씁니다.</b></div>`:''}
+      <div class="card" style="margin-top:12px;background:var(--bg2,rgba(128,128,128,.06))">
+        <div class="hd" style="font-weight:600;margin-bottom:8px">실제 체결 입력 <span class="hint">제안과 다르게 체결됐으면 수정 — 원장은 실제 값으로 기록됩니다</span></div>
+        ${r.sells.length? `<table style="width:100%;font-size:12.5px"><tr><th style="text-align:left">매도 로트</th><th>계획</th><th>실제 수량</th></tr>
+          ${r.sells.map((l,si)=>`<tr><td>${l.d} · ${fUSD(num(l.p))}</td><td style="text-align:center">${l.planSell}</td>
+            <td style="text-align:center"><input data-stsq="${si}" value="${l.planSell}" inputmode="numeric" style="width:72px;text-align:center"></td></tr>`).join('')}
+          </table>
+          <div style="margin-top:6px"><label class="f" style="display:inline-flex;gap:6px;align-items:center"><span class="l">평균 매도단가 ($)</span>
+            <input id="st-sp-${k}" value="${r.p}" style="width:110px"></label></div>`
+        : '<div class="hint">오늘 매도 없음</div>'}
+        <div style="margin-top:10px;display:flex;gap:12px;flex-wrap:wrap">
+          <label class="f"><span class="l">실제 매수 수량</span><input id="st-bn-${k}" value="${r.N}" inputmode="numeric" style="width:90px"></label>
+          <label class="f"><span class="l">실제 매수단가 ($)</span><input id="st-bp-${k}" value="${r.p}" style="width:110px"></label>
+        </div>
+      </div>
       <div class="btnrow"><button class="btn" data-stapply="${k}">원장·기록에 반영</button>
         <button class="btn g" data-stclear="${k}">닫기</button></div>`;
     box._r=r;
     $$('[data-stapply]',box).forEach(x=> x.onclick=()=>{
       const rr=box._r; const bb=S.books[k];
-      const del=new Set(rr.sells.map(l=>l.i));
-      bb.lots=(bb.lots||[]).filter((_,i)=>!del.has(i));
-      if(rr.N>0) bb.lots.push({d:rr.d, p:rr.p, q:rr.N, mode:rr.mode});
+      // 실제 체결 값 수집
+      const acts = rr.sells.map((l,si)=>{
+        const el=box.querySelector(`[data-stsq="${si}"]`);
+        const v=Math.max(0, Math.min(num(l.q), Math.floor(num(el? el.value : l.planSell))));
+        return {i:l.i, act:v, plan:l.planSell};
+      });
+      const actS = acts.reduce((s,a)=>s+a.act,0);
+      const actN = Math.max(0, Math.floor(num(($('#st-bn-'+k)||{}).value ?? rr.N)));
+      const bpIn = num(($('#st-bp-'+k)||{}).value); const bp = bpIn>0? bpIn : rr.p;
+      const spIn = num(($('#st-sp-'+k)||{}).value); const sp = spIn>0? spIn : rr.p;
+      const manual = actS!==rr.S || actN!==rr.N || cents(bp)!==cents(rr.p) || (rr.S>0 && cents(sp)!==cents(rr.p));
+      // 부분매도: 잔량 차감, 0이 되면 삭제 (계약 유지)
+      const dec=new Map(acts.map(a=>[a.i,a.act]));
+      bb.lots=(bb.lots||[]).map((l,i)=>{
+        if(!dec.has(i)) return l;
+        const rem=num(l.q)-dec.get(i);
+        return rem>0 ? Object.assign({},l,{q:rem}) : null;
+      }).filter(Boolean);
+      if(actN>0) bb.lots.push(stampNewLot(bb,{d:rr.d, p:bp, q:actN, mode:rr.mode}));
       bb.records=(bb.records||[]).filter(x=>x.d!==rr.d);
-      bb.records.push({d:rr.d, close:rr.p, buy:rr.N, sell:rr.S});
+      const rec={d:rr.d, close:rr.p, buy:actN, sell:actS};
+      if(actN>0 && cents(bp)!==cents(rr.p)) rec.bp=bp;
+      if(actS>0 && cents(sp)!==cents(rr.p)) rec.sp=sp;
+      if(manual) rec.man=1;
+      bb.records.push(rec);
       bb.records.sort((a,c)=> a.d<c.d?-1:1);
       touch(); renderBook(k);
-      toast(`정산 완료 · 매수 ${rr.N}주 / 매도 ${rr.S}주 반영`);
+      auditNote(k, 'settle', `${rr.d} 매수 ${actN}(계획 ${rr.N}) 매도 ${actS}(계획 ${rr.S})${manual?' · 수동수정':''}`);
+      toast(`정산 완료 · 매수 ${actN}주 / 매도 ${actS}주 반영${manual?' (수동 수정됨)':''}`);
     });
     $$('[data-stclear]',box).forEach(x=> x.onclick=()=>{ box.innerHTML=''; });
   });
@@ -1647,6 +2092,108 @@ async function cloudPull(){
   if(!j.cfg || !j.cfg.data) return {empty:true};
   return {state:JSON.parse(j.cfg.data), savedAt:j.cfg.at};
 }
+/* ── 전략 지문 · 검증본 대조 ───────────────────────────── */
+function strategyConfigOfBook(k){
+  const b=S.books[k], E={seed: b.seedKRW/(S.fx||1)+b.seedUSD};
+  return {
+    symbol:k, capital: Math.round(E.seed), splits:num(b.splits), maxOpenLots:0,
+    buyFeeRate:num(b.fee), sellFeeRate:num(b.fee),
+    feeModel:'exact', feeNettingMode:'legacy-overlap-netting',
+    quantityModel:'order-limit-price', buyLimitFormulaVersion:'strict-cents-1',
+    aggrTarget:num(b.aggrTarget), aggrHold:num(b.aggrDays),
+    safeTarget:num(b.safeTarget), safeHold:num(b.safeDays),
+    buyCap:num(b.buyLimitPct), sellDayBuyRule:num(b.sellDayBuyRule),
+    rsiSource:b.rsiSource, rsiPeriod:num(b.rsiPeriod), rsiUpper:num(b.rsiUpper), rsiLower:num(b.rsiLower),
+    defaultMode:b.baseMode,
+    vxnEnabled:!!b.vxnOn, vxnModel:'four-stage', vxnSource:'index',
+    vxnStableThreshold:num(b.vxnCalm), vxnCautionThreshold:num(b.vxnWarn), vxnPanicThreshold:num(b.vxnPanic),
+    vxnStableMultiplier:num(b.vxnCalmRatio), vxnNormalMultiplier:num(b.vxnNormRatio),
+    vxnCautionMultiplier:num(b.vxnWarnRatio), vxnPanicMultiplier:num(b.vxnPanicRatio),
+    vxnForceSafeOnCaution:!!b.vxnForceSafe, vxnForceSafeOnPanic:!!b.vxnForceSafe,
+    vxnLagSessions:1,
+    riskMaFilter:false, riskVolFilter:false,
+    safeCut:!!b.safeCut, safeCutRatio:num(b.safeCutRatio), defenseRatio:0,
+    holidayCalendar:'actual-market-sessions'
+  };
+}
+async function renderFingerprint(k){
+  const el=$('#fp-'+k); if(!el) return;
+  try{
+    const h=await StrategyCore.hashStrategyConfig(strategyConfigOfBook(k));
+    const b=S.books[k];
+    const applied=b.appliedRelease;
+    let txt='지문 '+h.short, cls='';
+    if(applied){
+      if(applied.strategyHashShort===h.short) txt+=' · 검증본 일치 ✓';
+      else txt+=' · 검증본('+applied.strategyHashShort+')과 다름 — 미검증 설정';
+    } else txt+=' · 검증본 미적용';
+    if(b.manualMode && b.manualMode!=='자동') txt+=' · 수동 모드';
+    el.textContent=txt;
+  }catch(e){ el.textContent=''; }
+}
+async function fetchRelease(k){
+  const j=await hubGet(hubUrl({mode:'slotget', slot:'verified_release:'+k}));
+  if(j.ok===false) throw new Error(j.error||'불러오기 실패');
+  if(!j.entry || !j.entry.data) throw new Error('발행된 검증본이 없습니다 — 백테스터에서 「검증본으로 확정」을 먼저 실행하세요');
+  return JSON.parse(j.entry.data);
+}
+const REL_MAP = [   // [검증본 파라미터 키, book 필드, 표시명]
+  ['splits','splits','분할 수'], ['buyFeeRate','fee','수수료'],
+  ['aggrTarget','aggrTarget','[공세] 목표'], ['aggrHold','aggrDays','[공세] 보유일'],
+  ['safeTarget','safeTarget','[안전] 목표'], ['safeHold','safeDays','[안전] 보유일'],
+  ['buyCap','buyLimitPct','매수 제한 상승률'], ['sellDayBuyRule','sellDayBuyRule','매도일 매수금지'],
+  ['rsiPeriod','rsiPeriod','RSI 기간'], ['rsiUpper','rsiUpper','RSI 상단'], ['rsiLower','rsiLower','RSI 하단'],
+  ['defaultMode','baseMode','기준 모드'],
+  ['vxnEnabled','vxnOn','VXN 사용'],
+  ['vxnStableThreshold','vxnCalm','VXN 안정'], ['vxnCautionThreshold','vxnWarn','VXN 경계'],
+  ['vxnPanicThreshold','vxnPanic','VXN 패닉'],
+  ['vxnStableMultiplier','vxnCalmRatio','안정 배수'], ['vxnNormalMultiplier','vxnNormRatio','보통 배수'],
+  ['vxnCautionMultiplier','vxnWarnRatio','경계 배수'], ['vxnPanicMultiplier','vxnPanicRatio','패닉 배수'],
+  ['safeCut','safeCut','안전모드 축소'], ['safeCutRatio','safeCutRatio','안전 매수비율']
+];
+async function reviewRelease(k){
+  const el=$('#rel-'+k);
+  try{
+    if(el) el.textContent='검증본 확인 중…';
+    const rel=await fetchRelease(k);
+    const b=S.books[k], pr=rel.parameters||{};
+    const diffs=REL_MAP.filter(([rk,bk])=>{
+      const rv=pr[rk], bv=b[bk];
+      if(typeof bv==='boolean'||typeof rv==='boolean'||rv===0||rv===1&&typeof b[bk]==='boolean')
+        return (!!rv)!==(!!bv);
+      return String(rv)!==String(num(bv));
+    });
+    const head=`검증본 ${rel.releaseId||''}\n지문 ${rel.strategyHashShort} · ${String(rel.verifiedAt||'').slice(0,10)}`
+      + `\n백테스트: ${String(rel.dataStart||'')}~${String(rel.dataThrough||'')}`
+      + ` CAGR ${(num(rel.results?.cagr)*100).toFixed(1)}% · MDD ${(num(rel.results?.mdd)*100).toFixed(1)}%`;
+    if(!diffs.length){
+      b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
+      touch(); if(el) el.textContent='검증본과 일치 ✓'; renderFingerprint(k);
+      return alert(head+'\n\n현재 설정과 완전히 일치합니다. 배지를 갱신했습니다.');
+    }
+    const list=diffs.map(([rk,bk,nm])=>` · ${nm}: ${b[bk]} → ${pr[rk]}`).join('\n');
+    if(!confirm(head+`\n\n다음 ${diffs.length}개 파라미터가 다릅니다:\n`+list
+        +'\n\n적용할까요?\n(기존 보유 로트의 목표가·기한 계약은 바뀌지 않습니다 — 신규 로트부터 적용)')){
+      if(el) el.textContent='적용 안 함 — 현재 설정 유지 (미검증)'; return;
+    }
+    diffs.forEach(([rk,bk])=>{
+      const rv=(REL_MAP.find(x=>x[0]===rk)||[])[1];
+      b[bk] = (typeof b[bk]==='boolean') ? !!pr[rk] : (isNaN(+pr[rk])? pr[rk] : +pr[rk]);
+    });
+    b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
+    touch(); renderBook(k);
+    auditNote(k,'apply-release', rel.releaseId||rel.strategyHashShort);
+    toast('검증본을 적용했습니다 — 기존 로트 계약은 유지, 신규 로트부터 반영');
+  }catch(e){ if(el) el.textContent=e.message; }
+}
+
+function auditNote(book, action, note){
+  try{
+    if(!S.gsUrl) return;
+    const img=new Image();
+    img.src=hubUrl({mode:'audit', actor:'console:'+book, action, note:String(note).slice(0,200), _:Date.now()});
+  }catch(e){}
+}
 function setSyncDot(ok,msg){
   const el=$('#syncDot'); if(!el) return;
   el.style.color = ok?'var(--ok)':'var(--bad)';
@@ -1860,6 +2407,11 @@ async function unlockPrompt(){
   if(loaded) S=migrate(loaded);
   try{ const t=localStorage.getItem('lev2mode:theme'); if(t) S.theme=t; }catch(e){}
   await unlockPrompt();
+  // ── P0: 하루 1회 자동 백업 → 로트 계약 1회 마이그레이션 (멱등)
+  if(loaded) await backupState();
+  { const n=migrateContracts();
+    if(n>0){ await Store.set(S);
+      toast(`로트 ${n}건에 목표가·기한 계약을 고정했습니다 (이후 설정 변경은 신규 로트에만 적용)`); } }
   renderAll();
   snapshot(false);
   if(syncReady()){
@@ -1869,6 +2421,7 @@ async function unlockPrompt(){
         const keep={gsUrl:S.gsUrl, gsToken:S.gsToken, tdKey:S.tdKey, theme:S.theme};
         S=migrate(r.state); Object.assign(S,keep);
         S.cloudSavedAt=r.savedAt; S.syncLinked=true;
+        migrateContracts();
         await Store.set(S); renderAll();
         toast('클라우드의 최신 데이터를 불러왔습니다');
       } else if(r.savedAt){ S.cloudSavedAt=r.savedAt; S.syncLinked=true; }
