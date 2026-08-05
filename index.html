@@ -1165,7 +1165,7 @@ function renderOverview(){
 
   const keys=P.rows.slice(0,5).map(r=>r.t);
   const series=keys.map((k,i)=>({c:P.rows[i].c, pts:snaps.map(s=>num((s.w||{})[k]))}));
-  const mods=['SOXL','TQQQ'].map(k=>({k, E:engine(S.books[k])}));
+  const mods=bookKeys().map(k=>({k, E:engine(S.books[k])}));
 
   $('#p-ov').innerHTML = `
   <div class="eyebrow"><span>Portfolio · Holdings &amp; Weight</span><span>${todayISO()}</span></div>
@@ -1241,7 +1241,7 @@ function renderOverview(){
   <div class="sec">
     <div class="sec-h"><span class="n">04</span><h2>매매 모듈 현황</h2><span class="hint">2모드 계좌 대조용</span></div>
     <div class="grid g2">${mods.map(m=>`<div class="card">
-      <div class="lrow"><span class="dot" style="background:${m.k==='SOXL'?'var(--red)':'var(--orange)'}"></span>
+      <div class="lrow"><span class="dot" style="background:${bookColor(m.k)}"></span>
         <span class="nm">${m.k} 2모드</span><span class="sp"></span>
         <span class="badge ${m.E.mode==='안전'?'s':'a'}">${m.E.mode}</span></div>
       <div class="dl" style="margin-top:10px">
@@ -1788,10 +1788,9 @@ function renderSet(){
     <div class="card">
       <div class="fgrid c3">
         <label class="f"><span class="l">환율 (₩/$)</span><input data-s="fx" value="${S.fx}"></label>
-        <label class="f"><span class="l">SOXL 현재가</span><input data-p="SOXL:price" value="${S.books.SOXL.price}"></label>
-        <label class="f"><span class="l">SOXL 전일 종가</span><input data-p="SOXL:prevClose" value="${S.books.SOXL.prevClose}"></label>
-        <label class="f"><span class="l">TQQQ 현재가</span><input data-p="TQQQ:price" value="${S.books.TQQQ.price}"></label>
-        <label class="f"><span class="l">TQQQ 전일 종가</span><input data-p="TQQQ:prevClose" value="${S.books.TQQQ.prevClose}"></label>
+        ${bookKeys().map(k=>`
+        <label class="f"><span class="l">${k} 현재가</span><input data-p="${k}:price" value="${S.books[k].price}"></label>
+        <label class="f"><span class="l">${k} 전일 종가</span><input data-p="${k}:prevClose" value="${S.books[k].prevClose}"></label>`).join('')}
         <label class="f"><span class="l">보유 종목 가격</span><input value="개요 탭에서 수정" readonly></label>
       </div>
       <div class="note">전일 종가는 각 매매 탭에서 <b>⑥ 일별 매매 기록의 최근 종가</b>를 자동으로 씁니다(기본값).
@@ -1855,6 +1854,27 @@ function renderSet(){
   </div>
 
   <div class="sec">
+    <div class="sec-h"><span class="n">03-2</span><h2>매매 모듈 (종목)</h2>
+      <span class="hint">모듈별 원장·파라미터는 각 탭에서</span></div>
+    <div class="card">
+      ${bookKeys().map(k=>{
+        const b=S.books[k], nl=(b.lots||[]).length, nr=(b.records||[]).length;
+        return `<div class="lrow" style="padding:7px 0;border-bottom:1px solid var(--line)">
+          <span class="dot" style="background:${bookColor(k)}"></span>
+          <span class="nm">${k}</span>
+          <span style="color:var(--tx3);font-size:12px">로트 ${nl} · 기록 ${nr} · RSI ${b.rsiSource} ${b.rsiPeriod}주</span>
+          <span class="sp"></span>
+          <button class="btn sm dg" data-bookdel="${k}">삭제</button></div>`;
+      }).join('')}
+      <div class="btnrow" style="margin-top:10px;align-items:center;gap:8px">
+        <input id="newTicker" placeholder="티커 (예: SOXS)" style="width:130px;text-transform:uppercase" maxlength="10">
+        <button class="btn sm" id="bookAdd">모듈 추가</button>
+        <span class="note" style="margin:0;font-size:12px;color:var(--tx3)">추가 후 해당 탭의 ② 전략 파라미터에서 값을 꼭 확인하세요. 시세는 다음 갱신부터 자동 포함됩니다.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec">
     <div class="sec-h"><span class="n">04</span><h2>매매 규칙 요약</h2></div>
     <div class="card">
       <div class="note" style="font-size:13px;color:var(--tx2)">
@@ -1869,6 +1889,34 @@ function renderSet(){
   </div>`;
 
   $('#stMode').textContent = Store.mode==='cloud' ? 'Claude 계정 저장소 (기기 간 동기화)' : '이 브라우저 (localStorage)';
+
+  // ── 매매 모듈 추가·삭제
+  const addBtn=$('#bookAdd');
+  if(addBtn) addBtn.onclick=async()=>{
+    const inp=$('#newTicker');
+    const k=(inp.value||'').trim().toUpperCase();
+    if(!/^[A-Z0-9.\-]{1,10}$/.test(k)){ toast('티커는 영문·숫자 1~10자로 입력하세요'); return; }
+    if(['OV','SET','VXN','USDKRW'].includes(k)){ toast('사용할 수 없는 이름입니다'); return; }
+    if(S.books[k]){ toast(k+' 모듈이 이미 있습니다'); return; }
+    S.books[k]=newBook({ticker:k, rsiSource:'QQQ', seedKRW:0, seedUSD:0,
+      weekly:[], lots:[], records:[]});
+    await Store.set(S); renderAll();
+    auditNote(S.books[k],'module-add',k);
+    toast(k+' 모듈을 추가했습니다 — ② 전략 파라미터에서 시드·목표수익률을 설정하세요');
+    const tab=$$('.tab').find(t=>t.dataset.p===k.toLowerCase()); if(tab) tab.click();
+  };
+  $$('[data-bookdel]').forEach(el=> el.onclick=async()=>{
+    const k=el.dataset.bookdel;
+    if(bookKeys().length<=1){ toast('마지막 모듈은 삭제할 수 없습니다'); return; }
+    const b=S.books[k], nl=(b.lots||[]).length, nr=(b.records||[]).length;
+    if(!confirm(`${k} 모듈을 삭제할까요?\n\n보유 로트 ${nl}건 · 일별 기록 ${nr}건이 함께 삭제됩니다.\n삭제 전 자동 백업이 생성되며, 설정 탭의 데이터 내보내기로도 복구본을 만들 수 있습니다.`)) return;
+    if(nl>0 && !confirm(`${k}에 보유 로트 ${nl}건이 남아 있습니다. 정말 삭제할까요?`)) return;
+    await backupState('before-del-'+k);
+    auditNote(b,'module-del',`${k} 로트${nl} 기록${nr}`);
+    delete S.books[k];
+    await Store.set(S); renderAll();
+    toast(k+' 모듈을 삭제했습니다 (자동 백업 생성됨)');
+  });
   $$('#p-set [data-s]').forEach(el=> el.onchange=()=>{ S[el.dataset.s]=num(el.value); touch(); renderAll(); });
   $$('#p-set [data-p]').forEach(el=> el.onchange=()=>{ const [k,f]=el.dataset.p.split(':'); S.books[k][f]=num(el.value); touch(); renderAll(); });
   $('#expBtn').onclick = ()=>{
@@ -1994,7 +2042,7 @@ function applyQuote(j,src){
   // VXN 시계열 반영
   if(j.series && j.series.VXN && j.series.VXN.length){
     const vs=j.series.VXN.map(r=>({d:String(r[0]).slice(0,10), c:+r[1]})).filter(x=>x.c>0);
-    ['SOXL','TQQQ'].forEach(k=>{ S.books[k].vxnSeries=vs.slice(-400); });
+    bookKeys().forEach(k=>{ S.books[k].vxnSeries=vs.slice(-400); });
   }
   if(!Object.keys(QUOTE).length) throw new Error(
     '시트 아카이브가 비어 있습니다 — 「종목 데이터 수집」을 누르거나, 시트 메뉴 「2모드 콘솔 → 전체 시세 갱신」을 실행하세요');
@@ -2022,8 +2070,8 @@ function autoRecord(k,q){
   return n;
 }
 function quoteTickers(){
-  const t=['SOXL','TQQQ',...(S.holdings||[]).map(o=>o.t).filter(Boolean)];
-  if(S.books.SOXL.vxnOn||S.books.TQQQ.vxnOn) t.push('VXN');
+  const t=[...bookKeys(),...(S.holdings||[]).map(o=>o.t).filter(Boolean)];
+  if(bookKeys().some(k=>S.books[k].vxnOn)) t.push('VXN');
   return [...new Set(t)];
 }
 function quoteUrl(){ return hubUrl({mode:'quote', ids:quoteTickers().join(','), n:400}); }
@@ -2310,7 +2358,7 @@ async function fetchPrices(silent){
 
 /* Twelve Data — 무료 EOD 종가 (브라우저 직접 호출 허용, 하루 800크레딧) */
 async function tdQuote(){
-  const t=[...new Set(['SOXL','TQQQ',...(S.holdings||[]).map(o=>o.t).filter(Boolean)])];
+  const t=quoteTickers().filter(x=>x!=='VXN'&&x!=='USDKRW');
   const out={fx:0,prices:{}};
   const r=await fetch('https://api.twelvedata.com/time_series?symbol='+encodeURIComponent(t.join(','))
     +'&interval=1day&outputsize=2&apikey='+encodeURIComponent(S.tdKey));
@@ -2333,7 +2381,7 @@ async function tdQuote(){
 
 /* Claude API + 웹검색으로 시세 조회 — 아티팩트 안에서 동작하는 유일한 자동 경로 */
 async function aiQuote(){
-  const t=[...new Set(['SOXL','TQQQ',...(S.holdings||[]).map(o=>o.t).filter(Boolean)])];
+  const t=quoteTickers().filter(x=>x!=='VXN'&&x!=='USDKRW');
   const res=await fetch('https://api.anthropic.com/v1/messages',{
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:1500,
@@ -2361,21 +2409,62 @@ async function aiQuote(){
 function migrate(o){
   const s=JSON.parse(JSON.stringify(DEFAULT));
   Object.assign(s,o);
-  s.books={SOXL:newBook(Object.assign({},DEFAULT.books.SOXL,(o.books||{}).SOXL)),
-           TQQQ:newBook(Object.assign({},DEFAULT.books.TQQQ,(o.books||{}).TQQQ))};
+  s.books={};
+  const srcBooks=o.books||{};
+  for(const k of [...new Set([...Object.keys(DEFAULT.books), ...Object.keys(srcBooks)])]){
+    s.books[k]=newBook(Object.assign({ticker:k}, DEFAULT.books[k]||{}, srcBooks[k]||{}));
+  }
   s.holdings=o.holdings||o.others||DEFAULT.holdings; delete s.others;
   s.snapshots=o.snapshots||[];
   s.syncLinked=false;   // 기기별 상태 — 받은 쪽에서 다시 설정
   return s;
 }
-function renderAll(){ renderOverview(); renderBook('SOXL'); renderBook('TQQQ'); renderSet(); }
+function bookKeys(){ return Object.keys(S.books||{}); }
+const BOOK_GLYPHS=['▲','◆','●','■','◈','▣','✦','◉'];
+const BOOK_COLORS=['var(--red)','var(--orange)','var(--blue)','var(--purple)','var(--green)','var(--amber)'];
+function bookGlyph(k){ return BOOK_GLYPHS[Math.max(0,bookKeys().indexOf(k))%BOOK_GLYPHS.length]; }
+function bookColor(k){ return BOOK_COLORS[Math.max(0,bookKeys().indexOf(k))%BOOK_COLORS.length]; }
+let _tabSig='';
+function rebuildTabs(){
+  const sig=bookKeys().join(',');
+  if(sig===_tabSig && $$('.tab').length===bookKeys().length+2) return;
+  _tabSig=sig;
+  const cur=(document.querySelector('.tab.on')||{}).dataset?.p || 'ov';
+  const nav=document.querySelector('nav.tabs .inner');
+  nav.innerHTML = `<button class="tab" data-p="ov"><span class="g">◎</span><span class="t">개요</span></button>`
+    + bookKeys().map(k=>`<button class="tab" data-p="${k.toLowerCase()}"><span class="g">${bookGlyph(k)}</span><span class="t">${k}</span></button>`).join('')
+    + `<button class="tab" data-p="set"><span class="g">⚙</span><span class="t">설정</span></button>`;
+  // 페이지 컨테이너 동기화 (p-ov, p-set 은 고정)
+  const main=document.querySelector('main.wrap');
+  const want=new Set(bookKeys().map(k=>'p-'+k.toLowerCase()));
+  $$('main.wrap section.page').forEach(sec=>{
+    if(sec.id!=='p-ov'&&sec.id!=='p-set'&&!want.has(sec.id)) sec.remove();
+  });
+  const foot=document.querySelector('main.wrap .foot');
+  for(const k of bookKeys()){
+    const id='p-'+k.toLowerCase();
+    if(!document.getElementById(id)){
+      const sec=document.createElement('section');
+      sec.className='page'; sec.id=id;
+      main.insertBefore(sec, document.getElementById('p-set'));
+    }
+  }
+  const target = $$('.tab').find(t=>t.dataset.p===cur) || $$('.tab')[0];
+  $$('.tab').forEach(t=> t.onclick=()=>{
+    $$('.tab').forEach(x=>x.classList.remove('on')); t.classList.add('on');
+    $$('.page').forEach(p=>p.classList.remove('on'));
+    const pg=$('#p-'+t.dataset.p); if(pg) pg.classList.add('on');
+    window.scrollTo({top:0,behavior:'instant'});
+  });
+  if(target){
+    $$('.page').forEach(p=>p.classList.remove('on'));
+    target.classList.add('on');
+    const pg=$('#p-'+target.dataset.p); if(pg) pg.classList.add('on');
+  }
+}
+function renderAll(){ rebuildTabs(); renderOverview(); bookKeys().forEach(k=>renderBook(k)); renderSet(); }
 
-$$('.tab').forEach(t=> t.onclick=()=>{
-  $$('.tab').forEach(x=>x.classList.remove('on')); t.classList.add('on');
-  $$('.page').forEach(p=>p.classList.remove('on'));
-  $('#p-'+t.dataset.p).classList.add('on');
-  window.scrollTo({top:0,behavior:'instant'});
-});
+/* 탭 바인딩은 rebuildTabs() 가 담당 */
 $('#btnSave').onclick=async()=>{ snapshot(true); await save(); toast('저장했습니다'); renderOverview(); };
 $('#btnTheme').onclick=()=>{
   const order=['system','light','dark'];
