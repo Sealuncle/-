@@ -199,6 +199,11 @@ textarea{min-height:110px;resize:vertical;line-height:1.6}
 @media(min-width:820px){.toast{bottom:24px}.toast.on{bottom:32px}}
 svg{display:block;max-width:100%}
 .scroll-x{overflow-x:auto}
+/* 자격증명 입력: type=password 를 쓰지 않고 시각적으로만 가린다.
+   password 필드는 브라우저 비밀번호 관리자가 로그인 폼으로 오인해
+   새로고침마다 인접 칸에 값을 자동으로 채워 넣는 문제가 있다. */
+.maskin{-webkit-text-security:disc;text-security:disc}
+.maskin.show{-webkit-text-security:none;text-security:none}
 </style>
 <script>
 (function(){
@@ -301,6 +306,7 @@ const Store = {
       PIN을 걸면 앱을 열 때마다 PIN을 입력해야 시트에 접근합니다.
    ============================================================ */
 const CRED_KEY='lev2mode:cred', CRED_FIELDS=['gsUrl','gsToken','tdKey'];
+let CRED_TOUCHED=false;   // 사용자가 자격증명 칸을 직접 만졌는지 (자동완성 구분용)
 const b64={ enc:buf=>btoa(String.fromCharCode(...new Uint8Array(buf))),
             dec:str=>Uint8Array.from(atob(str), c=>c.charCodeAt(0)) };
 async function deriveKey(pin, salt){
@@ -920,39 +926,11 @@ function settle(b,E,close,dateISO){
         매수·매도 지정가가 겹치지 않도록 재배치 (자전거래 방지).
    v(p) = (p ≤ 매수지정가 ? N : 0) − Σ(목표가 ≤ p 인 LOC 매도) − MOC 강제매도
 ------------------------------------------------------------ */
-/* ── 전략 지문·검증본 (P0-배지) ─────────────────────────────
-   백테스터 strategyConfigOf 와 동일한 키 구성으로 콘솔 북을 매핑한다.
-   콘솔에 없는 백테스터 전용 필드는 표준값으로 고정한다. */
-function strategyConfigOfBook(b, E){
-  return {
-    symbol: b.ticker,
-    capital: Math.round(E ? E.seedUSD : (num(b.seedKRW)/(S.fx||1)+num(b.seedUSD))),
-    splits: num(b.splits), maxOpenLots: 0,
-    buyFeeRate: num(b.fee), sellFeeRate: num(b.fee),
-    feeModel: 'exact', feeNettingMode: 'legacy-overlap-netting',
-    quantityModel: 'order-limit-price', buyLimitFormulaVersion: 'strict-cents-1',
-    aggrTarget: num(b.aggrTarget), aggrHold: num(b.aggrDays),
-    safeTarget: num(b.safeTarget), safeHold: num(b.safeDays),
-    buyCap: num(b.buyLimitPct), sellDayBuyRule: num(b.sellDayBuyRule),
-    rsiSource: b.rsiSource, rsiPeriod: num(b.rsiPeriod),
-    rsiUpper: num(b.rsiUpper), rsiLower: num(b.rsiLower),
-    defaultMode: b.baseMode,
-    vxnEnabled: !!b.vxnOn, vxnModel: 'four-stage', vxnSource: 'index',
-    vxnStableThreshold: num(b.vxnCalm), vxnCautionThreshold: num(b.vxnWarn), vxnPanicThreshold: num(b.vxnPanic),
-    vxnStableMultiplier: num(b.vxnCalmRatio), vxnNormalMultiplier: num(b.vxnNormRatio),
-    vxnCautionMultiplier: num(b.vxnWarnRatio), vxnPanicMultiplier: num(b.vxnPanicRatio),
-    vxnForceSafeOnCaution: !!b.vxnForceSafe, vxnForceSafeOnPanic: !!b.vxnForceSafe,
-    vxnLagSessions: 1,
-    riskMaFilter: false, riskVolFilter: false,
-    safeCut: !!b.safeCut, safeCutRatio: num(b.safeCutRatio), defenseRatio: 0,
-    holidayCalendar: 'actual-market-sessions'
-  };
-}
 const FP_CACHE = {};   // k → {short, at}
 async function refreshBookFingerprint(k){
   try{
     const b=S.books[k]; if(!b||typeof StrategyCore==='undefined') return;
-    const h=await StrategyCore.hashStrategyConfig(strategyConfigOfBook(b, engine(b)));
+    const h=await StrategyCore.hashStrategyConfig(strategyConfigOfBook(k));
     FP_CACHE[k]={short:h.short, hash:h.hash};
     const el=document.querySelector('#fp-'+k.toLowerCase());
     if(el){
@@ -963,12 +941,24 @@ async function refreshBookFingerprint(k){
                 : `현재 설정 <b>${h.short}</b> · <span style="color:var(--warn)">검증본 ${rel.strategyHashShort}와 다름 (미검증)</span>`)
         : `현재 설정 <b>${h.short}</b> · <span style="color:var(--tx3)">적용된 검증본 없음</span>`;
     }
-  }catch(e){}
+  }catch(e){
+    const el=document.querySelector('#fp-'+k.toLowerCase());
+    if(el) el.innerHTML=`<span style="color:var(--bad)">지문 계산 실패 — ${esc(e.message||e)}</span>`;
+  }
 }
 async function loadRelease(k){
   if(!syncReady()){ toast('설정 탭에서 구글시트 연동을 먼저 완료하세요'); return; }
+  const btn=document.querySelector('[data-relload="'+k+'"]');
+  const label=btn? btn.textContent : '';
+  if(btn){ btn.disabled=true; btn.textContent='확인 중…'; }
+  toast(k+' 검증본을 확인하는 중입니다…');
+  const restore=()=>{ if(btn){ btn.disabled=false; btn.textContent=label; } };
   try{
-    const r=await hubGet(hubUrl({mode:'slotget', slot:'verified_release:'+k}));
+    const r=await Promise.race([
+      hubGet(hubUrl({mode:'slotget', slot:'verified_release:'+k})),
+      new Promise((_,rej)=> setTimeout(()=> rej(new Error('응답이 없습니다 (20초) — 시트 배포 상태를 확인하세요')), 20000))
+    ]);
+    if(r && r.ok===false) throw new Error((r.error||'')+' — 설정 탭의 「연결 진단」으로 브리지 버전을 확인하세요');
     if(!r || !r.entry || !r.entry.data) throw new Error('시트에 '+k+' 검증본이 없습니다 — 백테스터에서 [검증본으로 확정]을 먼저 실행하세요');
     const rel=JSON.parse(r.entry.data);
     const b=S.books[k], p=rel.parameters||{};
@@ -994,16 +984,17 @@ async function loadRelease(k){
       await Store.set(S); renderAll();
       toast('검증본과 현재 설정이 이미 일치합니다 — 적용 표시만 갱신');
       auditNote(b,'release-apply','일치 '+rel.strategyHashShort);
-      return;
+      restore(); return;
     }
-    if(!confirm(head+'\n변경될 파라미터 (신규 로트부터 적용, 기존 로트 계약은 불변):\n'+diffs.join('\n')+'\n\n적용할까요?')) return;
+    if(!confirm(head+'\n변경될 파라미터 (신규 로트부터 적용, 기존 로트 계약은 불변):\n'+diffs.join('\n')+'\n\n적용할까요?')){ restore(); return; }
     for(const [pk,bk] of map){ if(p[pk]!==undefined&&p[pk]!==null) b[bk]=num(p[pk]); }
     if(p.vxnEnabled!==undefined) b.vxnOn=!!p.vxnEnabled;
     b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
     await Store.set(S); renderAll();
     toast('검증본 '+rel.strategyHashShort+' 적용 — 신규 로트부터 새 조건으로 매수합니다');
     auditNote(b,'release-apply',rel.releaseId+' 변경 '+diffs.length+'건');
-  }catch(e){ toast('검증본 불러오기 실패: '+(e.message||e)); }
+    restore();
+  }catch(e){ restore(); toast('검증본 불러오기 실패: '+(e.message||e)); }
 }
 
 function ladder(b,E){
@@ -1747,11 +1738,14 @@ function renderSet(){
       <span class="hint">${S.lastFetch? '최근 갱신 '+S.lastFetch : '미연동'}</span></div>
     <div class="card">
       <label class="f"><span class="l">Apps Script 웹앱 URL (…/exec 로 끝나는 주소)</span>
-        <input data-s2="gsUrl" value="${esc(S.gsUrl||'')}" placeholder="https://script.google.com/macros/s/AKfy…/exec"></label>
+        <input data-s2="gsUrl" value="${esc(S.gsUrl||'')}" placeholder="https://script.google.com/macros/s/AKfy…/exec"
+          name="lev2mode-gsurl" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-form-type="other"></label>
       <label class="f" style="margin-top:12px"><span class="l">접근 토큰 (시트 메뉴 → 접근 토큰 발급)</span>
-        <input data-s2="gsToken" type="password" value="${esc(S.gsToken||'')}" placeholder="generateToken 실행 후 나오는 40자 토큰"></label>
+        <input data-s2="gsToken" class="maskin" value="${esc(S.gsToken||'')}" placeholder="generateToken 실행 후 나오는 40자 토큰"
+          name="lev2mode-gstoken" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-form-type="other"></label>
       <label class="f" style="margin-top:12px"><span class="l">Twelve Data API 키 (선택 · 아래 참고)</span>
-        <input data-s2="tdKey" value="${esc(S.tdKey||'')}" placeholder="twelvedata.com 무료 가입 후 발급되는 키"></label>
+        <input data-s2="tdKey" class="maskin" value="${esc(S.tdKey||'')}" placeholder="twelvedata.com 무료 가입 후 발급되는 키"
+          name="lev2mode-tdkey" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-form-type="other"></label>
       <div class="note">구글시트가 막히는 환경(사내망 등)을 위한 예비 소스입니다. twelvedata.com 에서 무료 가입하면
         하루 800회 한도의 키를 즉시 받습니다. EOD 확정 종가를 날짜와 함께 반환하며 브라우저 직접 호출을 허용합니다.
         (Claude 아티팩트 안에서는 두 소스 모두 차단되고 AI 조회가 대신 동작합니다)</div>
@@ -1936,7 +1930,31 @@ function renderSet(){
     catch(e){ toast('파일 형식을 확인하세요 (내보내기로 저장한 JSON이어야 합니다)'); }
     finally{ $('#impFile').value=''; } };
   $('#rstBtn').onclick = ()=>{ if(confirm('모든 데이터를 초기화합니다. 계속할까요?')){ S=JSON.parse(JSON.stringify(DEFAULT)); save(); renderAll(); } };
-  $$('#p-set [data-s2]').forEach(el=> el.onchange=()=>{ S[el.dataset.s2]=el.value.trim(); touch(); renderSet(); });
+  $$('#p-set [data-s2]').forEach(el=>{
+    // 렌더 직후 브라우저가 값을 덮어써도 원본으로 되돌린다 (자동완성 방어)
+    const own=el.dataset.s2, mine=S[own]||'';
+    el.value=mine;
+    setTimeout(()=>{ if(!CRED_TOUCHED && el.value!==(S[own]||'')) el.value=S[own]||''; }, 400);
+    el.onfocus=()=>{ CRED_TOUCHED=true; };
+    el.onchange=()=>{
+      const v=el.value.trim();
+      // 다른 자격증명 칸의 값이 그대로 복사돼 들어온 경우 = 자동완성. 저장하지 않는다.
+      const others=CRED_FIELDS.filter(f=>f!==own).map(f=>(S[f]||'')).filter(Boolean);
+      if(v && others.includes(v)){
+        el.value=S[own]||'';
+        toast('브라우저 자동완성이 다른 칸의 값을 채웠습니다 — 저장하지 않았습니다');
+        return;
+      }
+      S[own]=v; touch(); renderSet();
+    };
+  });
+  // 자격증명 표시 토글
+  $$('#p-set .maskin').forEach(el=>{
+    if(el.dataset.eye) return;
+    el.dataset.eye='1';
+    el.addEventListener('dblclick', ()=> el.classList.toggle('show'));
+    el.title='두 번 클릭하면 값이 보입니다';
+  });
   $$('#p-set [data-tg2]').forEach(el=> el.onclick=()=>{ S[el.dataset.tg2]=!S[el.dataset.tg2]; touch(); renderSet(); });
   $('#scriptBtn').onclick = ()=>{ const b=$('#scriptBox'); b.style.display = b.style.display==='none'?'block':'none'; };
   $$('#p-set [data-theme]').forEach(el=> el.onclick=()=>{
@@ -1978,12 +1996,19 @@ function renderSet(){
   const sd=m=>{ const el=$('#syncDiag'); if(el) el.innerHTML=m; };
   $('#pingBtn').onclick = async()=>{
     if(!S.gsUrl) return sd(diagLine(false,'연결','URL을 먼저 입력하세요'));
+    sd(diagLine(true,'연결','확인 중… (스크립트가 잠들어 있으면 5~10초 걸립니다)'));
     try{
-      let j; try{ j=JSON.parse(await (await fetch(S.gsUrl+(S.gsUrl.includes('?')?'&':'?')+'action=ping')).text()); }
-      catch(e){ j=await jsonp(S.gsUrl+(S.gsUrl.includes('?')?'&':'?')+'action=ping',10000); }
-      sd(j&&j.v>=3? diagLine(true,'연결','스크립트 v'+j.v+' 응답 정상')
-                  : diagLine(false,'연결','응답이 이상합니다 — v3 스크립트로 교체 후 「새 버전」 재배포했는지 확인'));
-    }catch(e){ sd(diagLine(false,'연결','실패: '+e.message+' — 이 환경이 외부 접속을 차단하거나(아티팩트), 배포 설정 문제입니다')); }
+      const j=await hubGet(hubUrl({mode:'ping'}));
+      if(j && j.ok===false) throw new Error(j.error||'응답 오류');
+      const build=(j&&j.build)||'(표시 없음)';
+      const modes=(j&&j.modes)||[];
+      const hasSlot=modes.indexOf('slotget')>=0 && modes.indexOf('slotset')>=0;
+      let out=diagLine(true,'연결','브리지 '+build+' 응답 정상');
+      out+= hasSlot
+        ? diagLine(true,'검증본 기능','사용 가능 (slotget/slotset 지원)')
+        : diagLine(false,'검증본 기능','미지원 — 시트 Apps Script를 새 브리지로 교체한 뒤 「배포 → 배포 관리 → 새 버전」으로 재배포하세요');
+      sd(out);
+    }catch(e){ sd(diagLine(false,'연결','실패: '+e.message+' — 배포 액세스 권한이 「모든 사용자」인지, 토큰이 이 시트의 값인지 확인하세요')); }
   };
   $('#pushBtn').onclick = async()=>{
     if(!syncReady()) return sd(diagLine(false,'올리기','URL과 동기화 암호를 먼저 설정하세요'));
@@ -2242,10 +2267,14 @@ function auditNote(book, action, note){
     img.src=hubUrl({mode:'audit', actor:'console:'+book, action, note:String(note).slice(0,200), _:Date.now()});
   }catch(e){}
 }
+let SYNC_MSG='클라우드 동기화 상태';
 function setSyncDot(ok,msg){
   const el=$('#syncDot'); if(!el) return;
   el.style.color = ok?'var(--ok)':'var(--bad)';
-  el.title = msg||'';
+  SYNC_MSG = msg || (ok?'클라우드 연결됨':'클라우드 연결 실패');
+  el.title = SYNC_MSG;
+  el.style.cursor='pointer';
+  el.onclick = ()=> toast(SYNC_MSG);   // 모바일은 tooltip 이 없어 탭으로 확인
 }
 
 /* ── 허브 호출 헬퍼 : 직접 fetch 실패 시 JSONP ── */
@@ -2358,6 +2387,8 @@ async function fetchPrices(silent){
 
 /* Twelve Data — 무료 EOD 종가 (브라우저 직접 호출 허용, 하루 800크레딧) */
 async function tdQuote(){
+  if(S.tdKey && S.gsToken && S.tdKey===S.gsToken)
+    throw new Error('Twelve Data 키 자리에 시트 접근 토큰이 들어 있습니다 — 설정에서 확인하세요');
   const t=quoteTickers().filter(x=>x!=='VXN'&&x!=='USDKRW');
   const out={fx:0,prices:{}};
   const r=await fetch('https://api.twelvedata.com/time_series?symbol='+encodeURIComponent(t.join(','))
