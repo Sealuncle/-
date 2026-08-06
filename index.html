@@ -256,7 +256,6 @@ svg{display:block;max-width:100%}
 <div class="toast" id="toast"></div>
 
 <script>
-const APPS_SCRIPT = "/** 레버리지 2모드 콘솔 — 브리지 v3  (시세 + 데이터 동기화)\n *  1) 시세: GOOGLEFINANCE 이력에서 최근 2개 확정 일별 종가(날짜 포함)\n *  2) 동기화: 앱 데이터를 이 시트의 _sync 탭에 저장/불러오기 (본인 전용 클라우드)\n *\n *  설정: 아래 TOKEN 을 본인만 아는 문자열로 바꾸세요. 앱의 「동기화 암호」와 같아야 합니다.\n *  배포: 배포 > 새 배포 > 웹 앱 / 실행 계정 = 나 / 액세스 권한 = 모든 사용자\n *  ※ 코드 수정 후에는 반드시 「배포 관리 → 새 버전」으로 재배포해야 반영됩니다.\n */\nvar TOKEN = 'CHANGE-ME';          // ★ 반드시 변경\n\nfunction doGet(e) {\n  var p = (e && e.parameter) || {};\n  if (p.action === 'load') return jsonOut(loadState(p), p);\n  if (p.action === 'meta') return jsonOut(meta(p), p);\n  if (p.action === 'ping') return jsonOut({ ok: true, v: 4 }, p);\n  return jsonOut(quotes(p), p);\n}\n\nfunction meta(p) {\n  if (p.token !== TOKEN) return { error: 'bad token' };\n  var sh = SpreadsheetApp.getActive().getSheetByName('_sync');\n  if (!sh || sh.getLastRow() < 1) return { empty: true };\n  return { ok: true, savedAt: String(sh.getRange(1, 2).getValue() || '') };\n}\n\nfunction doPost(e) {\n  var p = (e && e.parameter) || {};\n  if (p.token !== TOKEN) return jsonOut({ error: 'bad token' }, p);\n  var body = (e && e.postData && e.postData.contents) || '';\n  if (!body) return jsonOut({ error: 'empty body' }, p);\n  var sh = sheet('_sync');\n  // 충돌 감지: 클라이언트가 마지막으로 본 저장 시각(ifmatch)과 현재가 다르면\n  // 다른 기기가 그 사이에 저장한 것 → 덮어쓰기 거부 (force=1 이면 강행)\n  var cur = String(sh.getLastRow() >= 1 ? (sh.getRange(1, 2).getValue() || '') : '');\n  if (p.force !== '1' && cur && p.ifmatch !== undefined && p.ifmatch !== cur)\n    return jsonOut({ error: 'conflict', savedAt: cur }, p);\n  sh.clear();\n  var CH = 40000, rows = [];\n  for (var i = 0; i < body.length; i += CH) rows.push([body.slice(i, i + CH)]);\n  sh.getRange(1, 1, rows.length, 1).setValues(rows);\n  sh.getRange(1, 2).setValue(new Date().toISOString());\n  return jsonOut({ ok: true, savedAt: sh.getRange(1, 2).getValue(), bytes: body.length }, p);\n}\n\nfunction loadState(p) {\n  if (p.token !== TOKEN) return { error: 'bad token' };\n  var ss = SpreadsheetApp.getActive(), sh = ss.getSheetByName('_sync');\n  if (!sh || sh.getLastRow() < 1) return { empty: true };\n  var vals = sh.getRange(1, 1, sh.getLastRow(), 1).getValues();\n  var body = vals.map(function (r) { return r[0]; }).join('');\n  return { ok: true, savedAt: String(sh.getRange(1, 2).getValue() || ''), state: body };\n}\n\nfunction quotes(p) {\n  var t = (p.tickers || 'SOXL,TQQQ').split(',')\n          .map(function (s) { return s.trim().toUpperCase(); }).filter(String).slice(0, 20);\n  var sh = sheet('_quote'); sh.clear();\n  sh.getRange('A1').setFormula('=IFERROR(GOOGLEFINANCE(\"CURRENCY:USDKRW\"),\"\")');\n  for (var i = 0; i < t.length; i++)\n    sh.getRange(1, 3 + i * 3)\n      .setFormula('=IFERROR(GOOGLEFINANCE(\"' + t[i] + '\",\"close\",TODAY()-15,TODAY()),\"\")');\n  SpreadsheetApp.flush(); Utilities.sleep(1500); SpreadsheetApp.flush();\n  var tz = 'America/New_York';\n  // 완료된 마지막 세션 계산: ET 16:05 이전이면 당일 세션은 미완료\n  var nowET = new Date(Utilities.formatDate(new Date(), tz, \"yyyy/MM/dd HH:mm:ss\"));\n  var closed = nowET.getHours() > 16 || (nowET.getHours() === 16 && nowET.getMinutes() >= 5);\n  var cut = new Date(nowET.getFullYear(), nowET.getMonth(), nowET.getDate(), 12);\n  if (!closed) cut.setDate(cut.getDate() - 1);\n  while (cut.getDay() === 0 || cut.getDay() === 6) cut.setDate(cut.getDate() - 1);\n  var cutoff = Utilities.formatDate(cut, tz.split('/')[0] === 'America' ? Session.getScriptTimeZone() : tz, 'yyyy-MM-dd');\n  cutoff = cut.getFullYear() + '-' + ('0' + (cut.getMonth() + 1)).slice(-2) + '-' + ('0' + cut.getDate()).slice(-2);\n  var out = { fx: Number(sh.getRange('A1').getValue()) || 0,\n              asOf: new Date().toISOString(), src: 'googlefinance-history',\n              cutoff: cutoff, prices: {} };\n  for (var i = 0; i < t.length; i++) {\n    var vals = sh.getRange(1, 3 + i * 3, 20, 2).getValues()\n      .filter(function (r) { return r[0] instanceof Date && Number(r[1]) > 0; })\n      .filter(function (r) { return Utilities.formatDate(r[0], tz, 'yyyy-MM-dd') <= cutoff; });\n    if (!vals.length) continue;\n    var last = vals[vals.length - 1], prev = vals.length > 1 ? vals[vals.length - 2] : null;\n    out.prices[t[i]] = {\n      lastClose: Number(last[1]),\n      lastCloseDate: Utilities.formatDate(last[0], tz, 'yyyy-MM-dd'),\n      prevClose: prev ? Number(prev[1]) : 0,\n      prevCloseDate: prev ? Utilities.formatDate(prev[0], tz, 'yyyy-MM-dd') : ''\n    };\n  }\n  return out;\n}\n\nfunction sheet(name) {\n  var ss = SpreadsheetApp.getActive();\n  return ss.getSheetByName(name) || ss.insertSheet(name);\n}\nfunction jsonOut(obj, p) {\n  var json = JSON.stringify(obj);\n  if (p && p.callback)\n    return ContentService.createTextOutput(p.callback + '(' + json + ')')\n           .setMimeType(ContentService.MimeType.JAVASCRIPT);\n  return ContentService.createTextOutput(json)\n         .setMimeType(ContentService.MimeType.JSON);\n}\n";
 /* 초기 시드값 없음 — 개인 데이터는 소스에 포함하지 않습니다. 아래 함수로 예시(가짜) 데이터만 넣습니다. */
 const SEED_WEEKLY = [];
 const SEED_SOXL_LOTS = [];
@@ -266,7 +265,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
-const APP_BUILD='console-2.0.0-core1';
+const APP_BUILD='console-2.0.1-core1';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -619,17 +618,17 @@ const DEFAULT = {
 };
 let S = JSON.parse(JSON.stringify(DEFAULT));
 
+function localStatePayload(){
+  // PIN 잠금 중에는 자격증명을 localStorage/window.storage 평문에 다시 쓰지 않는다.
+  if(!isLocked()) return S;
+  const payload=Object.assign({}, S);
+  CRED_FIELDS.forEach(f=> payload[f]='');
+  return payload;
+}
+async function persistLocalState(){ return Store.set(localStatePayload()); }
 async function save(){
-  S.savedAt=Date.now();
-  // 잠금 시 자격증명은 로컬 평문 저장에서 제외한다.
-  // S 자체를 비웠다가 되돌리면 저장이 겹칠 때 빈 값이 굳어버리므로(토큰 소실),
-  // 반드시 사본을 만들어 저장한다. S 는 절대 변형하지 않는다.
-  let payload=S;
-  if(isLocked()){
-    payload=Object.assign({}, S);
-    CRED_FIELDS.forEach(f=> payload[f]='');
-  }
-  await Store.set(payload);
+  S.savedAt=Math.max(Date.now(), num(S.savedAt)+1);
+  await persistLocalState();
   cloudPush();
 }
 let saveTimer=null;
@@ -995,7 +994,7 @@ async function loadRelease(k){
       +(rel.results? `백테스트: CAGR ${(rel.results.cagr*100).toFixed(1)}% · MDD ${(rel.results.mdd*100).toFixed(1)}%\n`:'');
     if(!diffs.length){
       b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
-      await Store.set(S); renderAll();
+      await persistLocalState(); renderAll();
       toast('검증본과 현재 설정이 이미 일치합니다 — 적용 표시만 갱신');
       auditNote(b,'release-apply','일치 '+rel.strategyHashShort);
       restore(); return;
@@ -1004,7 +1003,7 @@ async function loadRelease(k){
     for(const [pk,bk] of map){ if(p[pk]!==undefined&&p[pk]!==null) b[bk]=num(p[pk]); }
     if(p.vxnEnabled!==undefined) b.vxnOn=!!p.vxnEnabled;
     b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
-    await Store.set(S); renderAll();
+    await persistLocalState(); renderAll();
     toast('검증본 '+rel.strategyHashShort+' 적용 — 신규 로트부터 새 조건으로 매수합니다');
     auditNote(b,'release-apply',rel.releaseId+' 변경 '+diffs.length+'건');
     restore();
@@ -1769,9 +1768,9 @@ function renderSet(){
       <div class="btnrow"><button class="btn" id="fetchPx">지금 갱신</button>
         <button class="btn g" id="openBtn">URL 새 창에서 열기</button>
         <button class="btn g" id="collectBtn">종목 데이터 수집</button>
-        <button class="btn g" id="scriptBtn">Apps Script 코드 보기</button>
         <button class="btn g" id="pasteBtn">수동 붙여넣기</button></div>
       <div class="note" style="font-size:12px;margin:10px 0 0;color:var(--tx3)">
+        Apps Script에는 이 앱 안의 예전 코드가 아니라 별도 파일 <b>leverage-2mode-bridge_revised.gs</b>를 사용하세요.<br>
         <b>종목 데이터 수집</b>은 시트에 각 종목의 <b>과거 종가 이력</b>(_ARCH_종목 탭)을 만들어 두는 작업입니다.
         새 종목을 추가했을 때 한 번만 누르면 되고, 매일 쓰는 「지금 갱신」과는 다릅니다.
         시트에서 GOOGLEFINANCE 수식을 계산하는 동안 최대 30초쯤 걸리며, 그동안 응답이 늦어 실패로 보일 수 있습니다.
@@ -1791,8 +1790,6 @@ function renderSet(){
         <div class="btnrow"><button class="btn sm" id="pasteGo">붙여넣은 값 적용</button></div>
       </div>
       <div class="note" id="fetchNote">시트의 GOOGLEFINANCE 값을 그대로 가져옵니다. 미국 주식 시세는 약 20분 지연이며, 장중에는 전일 종가가 <b>전 거래일 종가</b>로 고정됩니다.</div>
-      <label class="f" id="scriptBox" style="margin-top:14px;display:none"><span class="l">구글시트 → 확장 프로그램 → Apps Script 에 붙여넣기</span>
-        <textarea readonly style="min-height:300px;font-size:12px">${esc(APPS_SCRIPT)}</textarea></label>
     </div>
   </div>
 
@@ -1914,7 +1911,7 @@ function renderSet(){
     if(S.books[k]){ toast(k+' 모듈이 이미 있습니다'); return; }
     S.books[k]=newBook({ticker:k, rsiSource:'QQQ', seedKRW:0, seedUSD:0,
       weekly:[], lots:[], records:[]});
-    await Store.set(S); renderAll();
+    await persistLocalState(); renderAll();
     auditNote(S.books[k],'module-add',k);
     toast(k+' 모듈을 추가했습니다 — ② 전략 파라미터에서 시드·목표수익률을 설정하세요');
     const tab=$$('.tab').find(t=>t.dataset.p===k.toLowerCase()); if(tab) tab.click();
@@ -1928,7 +1925,7 @@ function renderSet(){
     await backupState('before-del-'+k);
     auditNote(b,'module-del',`${k} 로트${nl} 기록${nr}`);
     delete S.books[k];
-    await Store.set(S); renderAll();
+    await persistLocalState(); renderAll();
     toast(k+' 모듈을 삭제했습니다 (자동 백업 생성됨)');
   });
   $$('#p-set [data-s]').forEach(el=> el.onchange=()=>{ S[el.dataset.s]=num(el.value); touch(); renderAll(); });
@@ -1976,7 +1973,6 @@ function renderSet(){
     el.title='두 번 클릭하면 값이 보입니다';
   });
   $$('#p-set [data-tg2]').forEach(el=> el.onclick=()=>{ S[el.dataset.tg2]=!S[el.dataset.tg2]; touch(); renderSet(); });
-  $('#scriptBtn').onclick = ()=>{ const b=$('#scriptBox'); b.style.display = b.style.display==='none'?'block':'none'; };
   $$('#p-set [data-theme]').forEach(el=> el.onclick=()=>{
     S.theme=el.dataset.theme; try{ localStorage.setItem('lev2mode:theme', S.theme); }catch(e){}
     window.__themeApply(S.theme); touch(); renderSet(); });
@@ -1986,7 +1982,7 @@ function renderSet(){
       const pin=prompt('현재 PIN을 입력하면 잠금을 해제합니다.');
       if(!pin) return;
       try{ const c=await openCreds(pin, credBox()); Object.assign(S,c);
-        localStorage.removeItem(CRED_KEY); await Store.set(S); renderSet();
+        localStorage.removeItem(CRED_KEY); await persistLocalState(); renderSet();
         pd(diagLine(true,'잠금 해제','자격증명이 평문으로 저장됩니다')); }
       catch(e){ pd(diagLine(false,'잠금 해제','PIN이 올바르지 않습니다')); }
       return;
@@ -2048,13 +2044,16 @@ function renderSet(){
     }catch(e){ out+= diagLine(false,'읽기(GET)', e.message||String(e)); }
     // 2) 쓰기 (POST) — 실제 데이터는 건드리지 않고 슬롯 왕복만 확인
     try{
-      const r=await fetch(hubUrl({mode:'slotset', slot:'backtest_working', device:'diag', actor:'console-diag'}),
-                          {method:'POST', body:JSON.stringify({diag:1, at:new Date().toISOString()})});
-      const txt=await r.text();
-      let j=null; try{ j=JSON.parse(txt); }catch(_){}
-      if(!j) out+= diagLine(false,'쓰기(POST)','응답이 JSON 이 아닙니다 — '+txt.slice(0,60));
-      else if(j.ok===false) out+= diagLine(false,'쓰기(POST)', j.error+(/토큰/.test(j.error||'')? ' → 브라우저가 POST 를 리다이렉트하며 토큰을 잃는 환경입니다':''));
-      else out+= diagLine(true,'쓰기(POST)','정상 ('+(j.savedAt||'')+')');
+      const diagData=JSON.stringify({diag:1, at:new Date().toISOString(), nonce:Math.random().toString(36).slice(2)});
+      const j=await bridgePost(
+        {mode:'slotset', slot:'diagnostic', device:'diag', actor:'console-diag'},
+        diagData,
+        async()=>{
+          const v=await hubGet(hubUrl({mode:'slotget', slot:'diagnostic', _:Date.now()}));
+          return v?.entry?.data===diagData ? {ok:true, savedAt:v.entry.at, bytes:diagData.length, verifiedAfterOpaquePost:true} : null;
+        });
+      if(j.ok===false) out+= diagLine(false,'쓰기(POST)', j.error||'실패');
+      else out+= diagLine(true,'쓰기(POST)','정상'+(j.verifiedAfterOpaquePost?' · 응답 차단 후 GET 검증':'')+' ('+(j.savedAt||'')+')');
     }catch(e){ out+= diagLine(false,'쓰기(POST)', (e.message||String(e))+' — CORS 차단 환경일 수 있습니다'); }
     // 3) 검증본 슬롯
     for(const k of bookKeys()){
@@ -2088,7 +2087,7 @@ function renderSet(){
       const keep={gsUrl:S.gsUrl, gsToken:S.gsToken, tdKey:S.tdKey, theme:S.theme};   // 이 기기 설정 유지
       S=migrate(r.state); Object.assign(S,keep);
       S.savedAt=Date.now(); S.cloudSavedAt=r.savedAt; S.syncLinked=true;
-      await Store.set(S); renderAll(); toast('클라우드 데이터를 불러왔습니다');
+      await persistLocalState(); renderAll(); toast('클라우드 데이터를 불러왔습니다');
       sd(diagLine(true,'받기','완료 · 저장 시각 '+r.savedAt));
     }catch(e){ sd(diagLine(false,'받기','실패: '+e.message)); }
   };
@@ -2177,7 +2176,7 @@ function diagLine(ok,label,msg){
     <span style="color:${ok?'var(--tx2)':'var(--bad)'}">${esc(msg)}</span></div>`;
 }
 /* ── 구글시트 클라우드 동기화 ─────────────────────────────
-   설정된 gsUrl + syncToken 으로 앱 상태 전체를 _sync 탭에 저장/복원 */
+   설정된 gsUrl + 접근 토큰으로 앱 상태 전체를 _SLOTS/live_state에 저장/복원 */
 function syncReady(){ return !!S.gsUrl; }
 function hubUrl(params){
   const q=Object.assign({token:S.gsToken||''}, params);
@@ -2185,28 +2184,68 @@ function hubUrl(params){
     + Object.keys(q).map(k=>k+'='+encodeURIComponent(q[k])).join('&');
 }
 function syncUrl(action){ return hubUrl({mode:action==='save'?'cfgset':'cfgget'}); }
-let pushTimer=null, lastPushErr='';
+function cloudPayloadText(){
+  // URL·토큰·외부 API 키는 기기별 자격증명이다. 원장 슬롯에는 절대 업로드하지 않는다.
+  const copy=Object.assign({}, S);
+  CRED_FIELDS.forEach(f=> copy[f]='');
+  return JSON.stringify(copy);
+}
+async function bridgePost(params, payloadText, verifyAfterOpaqueFailure){
+  let directError=null;
+  try{
+    const r=await fetch(hubUrl(params), {method:'POST', body:payloadText, redirect:'follow', cache:'no-store'});
+    const text=await r.text();
+    if(/<html/i.test(text)) throw new Error('HTML 반환 — 배포 액세스 권한 「모든 사용자」 확인');
+    return JSON.parse(text);
+  }catch(e){ directError=e; }
+
+  // Apps Script POST는 서버 저장은 끝났지만 브라우저가 리다이렉트/CORS 응답만 차단하는 경우가 있다.
+  // 같은 요청을 재전송하지 않고 GET/JSONP로 저장 결과를 검증해 중복·충돌을 방지한다.
+  if(verifyAfterOpaqueFailure){
+    try{
+      const verified=await verifyAfterOpaqueFailure();
+      if(verified) return verified;
+    }catch(e){ directError=new Error((directError?.message||'POST 응답 실패')+' / 저장 확인 실패: '+(e.message||e)); }
+  }
+  throw directError || new Error('POST 전송 실패');
+}
+let pushTimer=null, lastPushErr='', pushQueue=Promise.resolve();
 function cloudPush(){                      // save() 에서 자동 호출 (디바운스)
   if(!syncReady()) return;
-  if(!S.syncLinked) return;                // ★ 최초 받기/올리기 전에는 자동 업로드 금지 (빈 상태로 덮어쓰기 방지)
+  if(!S.syncLinked) return;                // 최초 받기/올리기 전에는 자동 업로드 금지
   clearTimeout(pushTimer);
   pushTimer=setTimeout(()=> doPush(false,true), 1200);
 }
-async function doPush(force,silent){
+function doPush(force,silent){
+  const task=()=>doPushNow(force,silent);
+  const next=pushQueue.catch(()=>null).then(task);
+  pushQueue=next;
+  return next;
+}
+async function doPushNow(force,silent){
   try{
-    const r=await fetch(hubUrl({mode:'cfgset', ifmatch:S.cloudSavedAt||'', force:force?'1':'0', device:navigator.platform||'web'}),
-                        {method:'POST', body:JSON.stringify(S)});
-    const j=JSON.parse(await r.text());
+    S.savedAt=Math.max(Date.now(), num(S.savedAt)+1);
+    const payload=cloudPayloadText(), localStamp=String(S.savedAt);
+    const params={mode:'cfgset', ifmatch:S.cloudSavedAt||'', force:force?'1':'0', device:navigator.platform||'web'};
+    const j=await bridgePost(params, payload, async()=>{
+      const g=await hubGet(hubUrl({mode:'cfgget', _:Date.now()}));
+      if(!g || g.ok===false || !g.cfg || !g.cfg.data) return null;
+      let remote=null; try{ remote=JSON.parse(g.cfg.data); }catch(e){ return null; }
+      if(String(remote.savedAt||'')===localStamp)
+        return {ok:true, savedAt:g.cfg.at, bytes:payload.length, verifiedAfterOpaquePost:true};
+      if(params.ifmatch && String(g.cfg.at||'')!==String(params.ifmatch))
+        return {ok:false, error:'conflict', serverAt:g.cfg.at};
+      return null;
+    });
     if(j.error==='conflict' || (j.ok===false && j.error==='conflict')){
       setSyncDot(false,'다른 기기가 더 최신 데이터를 올렸습니다 — 「클라우드에서 받기」 먼저');
       if(!silent) throw new Error('충돌 — 클라우드에 더 최신 데이터가 있습니다. 「클라우드에서 받기」로 먼저 확인하세요');
       return null;
     }
-    if(/토큰/.test(j.error||'')) throw new Error(j.error);
-    if(j.error && j.error!=='conflict') throw new Error(j.error);
-    S.cloudSavedAt=j.savedAt; S.syncLinked=true; await Store.set(S);
+    if(j.ok===false || j.error) throw new Error(j.error||'저장 실패');
+    S.cloudSavedAt=j.savedAt; S.syncLinked=true; await persistLocalState();
     lastPushErr=''; setSyncDot(true,'클라우드 저장됨 '+new Date().toLocaleTimeString('ko-KR',{hour12:false}));
-    return j;
+    return Object.assign({bytes:payload.length},j);
   }catch(e){
     if(!silent) throw e;
     lastPushErr=e.message||'전송 실패'; setSyncDot(false,'클라우드 저장 실패: '+lastPushErr);
@@ -2214,10 +2253,8 @@ async function doPush(force,silent){
   }
 }
 async function cloudPull(){
-  if(!syncReady()) throw new Error('URL과 동기화 암호를 먼저 설정하세요');
-  let j;
-  try{ j=JSON.parse(await (await fetch(syncUrl('load'))).text()); }
-  catch(e){ j=await jsonp(syncUrl('load'),12000); }     // CORS 차단 시 JSONP
+  if(!syncReady()) throw new Error('URL과 접근 토큰을 먼저 설정하세요');
+  const j=await hubGet(hubUrl({mode:'cfgget', _:Date.now()}));
   if(j.ok===false) throw new Error(j.error||'불러오기 실패');
   if(!j.cfg || !j.cfg.data) return {empty:true};
   return {state:JSON.parse(j.cfg.data), savedAt:j.cfg.at};
@@ -2337,7 +2374,7 @@ function setSyncDot(ok,msg){
 /* ── 허브 호출 헬퍼 : 직접 fetch 실패 시 JSONP ── */
 async function hubGet(url){
   try{
-    const r=await fetch(url,{redirect:'follow'});
+    const r=await fetch(url,{redirect:'follow',cache:'no-store'});
     const t=await r.text();
     if(/<html/i.test(t)) throw new Error('HTML 반환 — 배포 액세스 권한 「모든 사용자」 확인');
     return JSON.parse(t);
@@ -2592,7 +2629,7 @@ async function unlockPrompt(){
   // ── P0: 하루 1회 자동 백업 → 로트 계약 1회 마이그레이션 (멱등)
   if(loaded) await backupState();
   { const n=migrateContracts();
-    if(n>0){ await Store.set(S);
+    if(n>0){ await persistLocalState();
       toast(`로트 ${n}건에 목표가·기한 계약을 고정했습니다 (이후 설정 변경은 신규 로트에만 적용)`); } }
   renderAll();
   snapshot(false);
@@ -2604,7 +2641,7 @@ async function unlockPrompt(){
         S=migrate(r.state); Object.assign(S,keep);
         S.cloudSavedAt=r.savedAt; S.syncLinked=true;
         migrateContracts();
-        await Store.set(S); renderAll();
+        await persistLocalState(); renderAll();
         toast('클라우드의 최신 데이터를 불러왔습니다');
       } else if(r.savedAt){ S.cloudSavedAt=r.savedAt; S.syncLinked=true; }
       setSyncDot(true,'클라우드 연결됨');
