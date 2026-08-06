@@ -621,10 +621,15 @@ let S = JSON.parse(JSON.stringify(DEFAULT));
 
 async function save(){
   S.savedAt=Date.now();
-  if(isLocked()){                      // 잠금 시 자격증명은 로컬 평문 저장에서 제외
-    const keep={}; CRED_FIELDS.forEach(f=>{ keep[f]=S[f]; S[f]=''; });
-    await Store.set(S); CRED_FIELDS.forEach(f=> S[f]=keep[f]);
-  } else await Store.set(S);
+  // 잠금 시 자격증명은 로컬 평문 저장에서 제외한다.
+  // S 자체를 비웠다가 되돌리면 저장이 겹칠 때 빈 값이 굳어버리므로(토큰 소실),
+  // 반드시 사본을 만들어 저장한다. S 는 절대 변형하지 않는다.
+  let payload=S;
+  if(isLocked()){
+    payload=Object.assign({}, S);
+    CRED_FIELDS.forEach(f=> payload[f]='');
+  }
+  await Store.set(payload);
   cloudPush();
 }
 let saveTimer=null;
@@ -690,15 +695,24 @@ function lotHoldLimit(b,l){ return l.ct? num(l.ct.hold) : (l.mode==='안전'? nu
 
 /** 보유 세션 수: ⑥ 일별 기록의 실제 세션(종가 존재일)으로 센다.
     기록이 성긴 경우 주말제외 근사(networkDays)로 보수 폴백하고 경고 플래그를 준다. */
-function heldSessions(b, lotDateISO, cutoffISO){
-  const nd = Math.max(0, networkDays(D(lotDateISO), D(cutoffISO)) - 1);
+/** 로트의 보유 세션 수.
+    기준은 "이번 주문이 체결될 세션(sessionISO)"이다. 매수 세션은 0으로 세고,
+    그 다음 세션부터 1, 2 … 로 증가한다. (원본 콘솔의 networkDays(매수일, 오늘)−1 과 같은 기준)
+    기록된 실제 거래 세션을 우선 사용하되, 아직 기록되지 않은 진행 중 세션도 1로 친다.
+    → 어제 매수한 로트는 오늘 주문 판단에서 보유 1세션이 되어 매도 대상에 포함된다. */
+function heldSessions(b, lotDateISO, sessionISO){
+  if(!lotDateISO || !sessionISO || lotDateISO>=sessionISO) return {held:0, src:'records', gap:0};
+  const nd = Math.max(0, networkDays(D(lotDateISO), D(sessionISO)) - 1);
+  // 매수일 다음날 ~ 기준 세션 사이의 기록된 세션 (기준 세션이 아직 기록 전이면 아래에서 +1)
   const recDays = new Set((b.records||[])
-    .filter(r=> r.d && num(r.close)>0 && r.d>lotDateISO && r.d<=cutoffISO)
+    .filter(r=> r.d && num(r.close)>0 && r.d>lotDateISO && r.d<=sessionISO)
     .map(r=> r.d));
-  const sess = recDays.size;
-  if(sess===0 && nd>0) return {held:nd, src:'networkDays', gap:nd};
+  let sess = recDays.size;
+  const pending = recDays.has(sessionISO) ? 0 : 1;   // 진행 중(미기록) 기준 세션
+  sess += pending;
+  if(recDays.size===0 && nd>sess) return {held:nd, src:'networkDays', gap:nd};
   const gap = Math.max(0, nd - sess);
-  return {held:sess, src:'records', gap};
+  return {held:sess, src: recDays.size? 'records' : 'networkDays', gap};
 }
 
 
@@ -837,7 +851,7 @@ function engine(b){
     const sp  = l.ct? num(l.ct.tp)
                     : r2(num(l.p)*(1+(l.mode==='안전'?num(b.safeTarget):num(b.aggrTarget))
                         +(2+(l.mode==='안전'?num(b.safeTarget):num(b.aggrTarget)))*num(b.fee)));
-    const hs  = heldSessions(b, l.d, E.cutoff);
+    const hs  = heldSessions(b, l.d, E.session);
     const held= hs.held;
     if(hs.src==='records' && hs.gap>=3) E.sessGapWarn++;
     const lim = l.ct? num(l.ct.hold) : (l.mode==='안전'? num(b.safeDays) : num(b.aggrDays));
@@ -1757,6 +1771,11 @@ function renderSet(){
         <button class="btn g" id="collectBtn">종목 데이터 수집</button>
         <button class="btn g" id="scriptBtn">Apps Script 코드 보기</button>
         <button class="btn g" id="pasteBtn">수동 붙여넣기</button></div>
+      <div class="note" style="font-size:12px;margin:10px 0 0;color:var(--tx3)">
+        <b>종목 데이터 수집</b>은 시트에 각 종목의 <b>과거 종가 이력</b>(_ARCH_종목 탭)을 만들어 두는 작업입니다.
+        새 종목을 추가했을 때 한 번만 누르면 되고, 매일 쓰는 「지금 갱신」과는 다릅니다.
+        시트에서 GOOGLEFINANCE 수식을 계산하는 동안 최대 30초쯤 걸리며, 그동안 응답이 늦어 실패로 보일 수 있습니다.
+      </div>
       <div id="diag" style="margin-top:10px">${DIAG}</div>
       ${Object.keys(QUOTE).length? `<div class="tw" style="margin-top:12px"><table style="min-width:460px">
         <thead><tr><th>종목</th><th>최근 종가</th><th>거래일</th><th>그 전 종가</th><th>거래일</th></tr></thead>
@@ -1801,9 +1820,10 @@ function renderSet(){
         <button class="btn" id="pullBtn">클라우드에서 받기</button>
         <button class="btn g" id="pushBtn">클라우드로 올리기</button>
         <button class="btn g" id="pingBtn">연결 확인</button>
+        <button class="btn g" id="diagBtn">동기화 진단</button>
       </div>
       <div id="syncDiag" style="margin-top:10px"></div>
-      <div class="note">데이터는 <b>본인 시트의 _CONFIG 탭</b>에만 저장되고,
+      <div class="note">데이터는 <b>본인 시트의 _SLOTS 탭(live_state 행)</b>에만 저장되고,
         저장 버튼을 누를 때마다 자동으로 올라갑니다. 다른 기기에서는 앱을 열고 <b>클라우드에서 받기</b> 한 번이면 이어서 작업할 수 있습니다.
         Claude 아티팩트 안에서는 외부 접속이 차단되어 이 동기화가 동작하지 않습니다 — 파일로 열거나 웹에 올려서 사용하세요.</div>
     </div>
@@ -2009,6 +2029,43 @@ function renderSet(){
         : diagLine(false,'검증본 기능','미지원 — 시트 Apps Script를 새 브리지로 교체한 뒤 「배포 → 배포 관리 → 새 버전」으로 재배포하세요');
       sd(out);
     }catch(e){ sd(diagLine(false,'연결','실패: '+e.message+' — 배포 액세스 권한이 「모든 사용자」인지, 토큰이 이 시트의 값인지 확인하세요')); }
+  };
+  $('#diagBtn').onclick = async()=>{
+    const tk=(S.gsToken||''), url=(S.gsUrl||'');
+    let out='';
+    out+= url? diagLine(true,'웹앱 주소', url.slice(0,42)+'… '+(/\/exec(\?|$)/.test(url)?'(/exec 정상)':'(/exec 로 끝나야 합니다)'))
+             : diagLine(false,'웹앱 주소','비어 있습니다');
+    out+= tk? diagLine(true,'토큰','입력됨 ('+tk.length+'자)'+(tk.length===40?'':' — 보통 40자입니다'))
+            : diagLine(false,'토큰','비어 있습니다 — PIN 취소 또는 자동완성으로 지워졌을 수 있습니다');
+    if(S.tdKey && S.tdKey===S.gsToken)
+      out+= diagLine(false,'값 오염','Twelve Data 키 자리에 시트 토큰이 들어 있습니다 — 다시 입력하세요');
+    sd(out+diagLine(true,'진행','읽기·쓰기 시험 중…'));
+    // 1) 읽기 (GET)
+    try{
+      const g=await hubGet(hubUrl({mode:'cfgget'}));
+      out+= (g && g.ok===false)? diagLine(false,'읽기(GET)', g.error||'실패')
+          : diagLine(true,'읽기(GET)', (g&&g.cfg&&g.cfg.data)? ('저장본 있음 · '+(g.cfg.at||'')) : '아직 저장본 없음 (정상)');
+    }catch(e){ out+= diagLine(false,'읽기(GET)', e.message||String(e)); }
+    // 2) 쓰기 (POST) — 실제 데이터는 건드리지 않고 슬롯 왕복만 확인
+    try{
+      const r=await fetch(hubUrl({mode:'slotset', slot:'backtest_working', device:'diag', actor:'console-diag'}),
+                          {method:'POST', body:JSON.stringify({diag:1, at:new Date().toISOString()})});
+      const txt=await r.text();
+      let j=null; try{ j=JSON.parse(txt); }catch(_){}
+      if(!j) out+= diagLine(false,'쓰기(POST)','응답이 JSON 이 아닙니다 — '+txt.slice(0,60));
+      else if(j.ok===false) out+= diagLine(false,'쓰기(POST)', j.error+(/토큰/.test(j.error||'')? ' → 브라우저가 POST 를 리다이렉트하며 토큰을 잃는 환경입니다':''));
+      else out+= diagLine(true,'쓰기(POST)','정상 ('+(j.savedAt||'')+')');
+    }catch(e){ out+= diagLine(false,'쓰기(POST)', (e.message||String(e))+' — CORS 차단 환경일 수 있습니다'); }
+    // 3) 검증본 슬롯
+    for(const k of bookKeys()){
+      try{
+        const v=await hubGet(hubUrl({mode:'slotget', slot:'verified_release:'+k}));
+        out+= (v && v.entry && v.entry.data)
+          ? diagLine(true,'검증본 '+k, JSON.parse(v.entry.data).strategyHashShort+' · '+(v.entry.at||''))
+          : diagLine(false,'검증본 '+k,'없음 — 백테스터에서 「검증본으로 확정」을 먼저 실행하세요');
+      }catch(e){ out+= diagLine(false,'검증본 '+k, e.message||String(e)); }
+    }
+    sd(out);
   };
   $('#pushBtn').onclick = async()=>{
     if(!syncReady()) return sd(diagLine(false,'올리기','URL과 동기화 암호를 먼저 설정하세요'));
@@ -2285,7 +2342,12 @@ async function hubGet(url){
     if(/<html/i.test(t)) throw new Error('HTML 반환 — 배포 액세스 권한 「모든 사용자」 확인');
     return JSON.parse(t);
   }catch(e){
-    if(e instanceof TypeError || /fetch/i.test(e.message)) return await jsonp(url,15000);
+    // CORS 차단(TypeError) 뿐 아니라 로그인/리다이렉트 HTML 이 온 경우에도
+    // JSONP 는 성공하는 경우가 많으므로 함께 폴백한다.
+    if(e instanceof TypeError || /fetch|HTML 반환/i.test(e.message)){
+      try{ return await jsonp(url,20000); }
+      catch(e2){ throw new Error(e.message+' / JSONP 도 실패: '+(e2.message||e2)); }
+    }
     throw e;
   }
 }
