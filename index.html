@@ -265,7 +265,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
-const APP_BUILD='console-2.0.1-core1';
+const APP_BUILD='console-2.0.2-core1';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -587,7 +587,7 @@ function newBook(o){
     seedKRW:10000000, seedUSD:625,
     price:0, prevClose:0, prevFromRecord:true,
     splits:7, fee:0.0025,
-    aggrTarget:0.14, aggrDays:8,
+    aggrTarget:0.10, aggrDays:12,
     safeTarget:0.01, safeDays:35,
     buyLimitPct:0.04,
     baseMode:'공세', manualMode:'자동', useRSI:true,
@@ -597,7 +597,7 @@ function newBook(o){
     vxnOn:false, vxnCalm:20, vxnWarn:28, vxnPanic:36,
     vxnCalmRatio:1.2, vxnNormRatio:1, vxnWarnRatio:0.5, vxnPanicRatio:0,
     vxnForceSafe:true, vxnSeries:[],
-    rsiPeriod:18, rsiUpper:66, rsiLower:38,
+    rsiPeriod:14, rsiUpper:70, rsiLower:40,
     weekly:[], lots:[], records:[]
   }, o||{});
 }
@@ -744,11 +744,16 @@ function rsiTable(b){
   return out;
 }
 function autoMode(b){
-  const t=rsiTable(b); if(!t.length) return {mode:b.baseMode, row:null, tbl:t};
+  const t=rsiTable(b);
+  // RSI 자동판정을 켠 상태에서 원천 데이터가 없거나 RSI가 아직 계산되지 않았다면
+  // 임의로 기준모드(과거에는 기본 '공세')를 사용하지 않는다. 신규매수는 엔진에서 보류한다.
+  if(!t.length) return {mode:null, row:null, tbl:t, ready:false, reason:'RSI 원천 데이터 없음'};
   const td=todayISO(); let row=null;
   for(const r of t){ if(r.apply<=td) row=r; }
   if(!row) row=t[t.length-1];
-  return {mode:row.mode, row, tbl:t};
+  const ready=!!(row && row.rsi!=null);
+  return {mode:ready?row.mode:null, row, tbl:t, ready,
+          reason:ready?'':'RSI 계산에 필요한 주간 데이터가 부족함'};
 }
 
 /* ============================================================
@@ -827,16 +832,17 @@ function engine(b){
   const am = autoMode(b);
   E.rsi = am;
   E.vxn = vxnState(b);
+  E.rsiMissing = b.manualMode==='자동' && !!b.useRSI && !am.ready;
   let mode;
   if(b.manualMode!=='자동') mode=b.manualMode;
   else if(!b.useRSI) mode=b.baseMode;
   else if(b.riskState==='방어') mode='안전';
   else if(b.riskState==='안전') mode='안전';
   else if(E.vxn.forceSafe) mode='안전';
-  else mode=am.mode;
+  else mode=am.mode || '판정대기';
   E.mode = mode;
-  E.target = mode==='안전'? b.safeTarget : b.aggrTarget;   // B35
-  E.limit  = mode==='안전'? b.safeDays  : b.aggrDays;      // B36
+  E.target = mode==='안전'? b.safeTarget : (mode==='공세'? b.aggrTarget : null);   // B35
+  E.limit  = mode==='안전'? b.safeDays  : (mode==='공세'? b.aggrDays : null);      // B36
 
   // 위험필터 매수비율 (G30) + 안전모드 매수축소
   let ratio = b.riskState==='방어' ? 0 : num(b.riskRatio);
@@ -888,10 +894,11 @@ function engine(b){
     blockedBySellRule: !E.allowBuy
   });
   const opBlocked = E.opMode!=='ACTIVE';
-  E.buyQty = (opBlocked || !E.buyEval.allowed) ? 0 : E.buyEval.plannedQty;
+  E.buyQty = (opBlocked || E.rsiMissing || !E.buyEval.allowed) ? 0 : E.buyEval.plannedQty;
   E.buyAmt = E.buyQty*E.buyLimit;
 
   E.buyMsg = opBlocked ? (E.opMode==='EXIT_ONLY' ? '신규매수 중단 — 기존 로트 청산 대기' : '신규매수 일시중단 — 운용 설정')
+           : E.rsiMissing ? '매수 보류 — '+(E.rsi.reason||'RSI 데이터 없음')+' (시세 갱신으로 '+b.rsiSource+' 이력을 먼저 수집하세요)'
            : E.buyEval.reason==='SELL_DAY_RULE' ? '매수 금지 — 매도일 매수금지 규칙'
            : E.buyEval.reason==='VXN_DATA_MISSING' ? '매수 보류 — 직전 세션 VXN 데이터 없음 (매도 관리는 정상)'
            : E.buyEval.reason==='MULTIPLIER_ZERO' ? (E.vxn.on && E.vxn.level==='패닉' ? '신규매수 중단 — VXN 패닉 구간' : '신규매수 중단 — 위험필터 방어 상태')
@@ -959,6 +966,29 @@ async function refreshBookFingerprint(k){
     if(el) el.innerHTML=`<span style="color:var(--bad)">지문 계산 실패 — ${esc(e.message||e)}</span>`;
   }
 }
+function isLegacyAddedTickerPlaceholder(b){
+  if(!b || ['SOXL','TQQQ'].includes(String(b.ticker||'').toUpperCase()) || b.appliedRelease) return false;
+  return Math.abs(num(b.aggrTarget)-0.14)<1e-12 && num(b.aggrDays)===8 &&
+         Math.abs(num(b.safeTarget)-0.01)<1e-12 && num(b.safeDays)===35 &&
+         num(b.rsiPeriod)===18 && num(b.rsiUpper)===66 && num(b.rsiLower)===38;
+}
+function repairPlaceholderLotContracts(b, oldCfg){
+  if(!oldCfg) return 0;
+  let n=0;
+  (b.lots||[]).forEach(l=>{
+    if(!l || !l.ct || !(num(l.p)>0)) return;
+    const oldT=l.mode==='안전'?num(oldCfg.safeTarget):num(oldCfg.aggrTarget);
+    const oldH=l.mode==='안전'?num(oldCfg.safeDays):num(oldCfg.aggrDays);
+    const exactOld=StrategyCore.calcTargetPrice(num(l.p),oldT,num(oldCfg.fee),num(oldCfg.fee),'exact');
+    const legacyOld=r2(num(l.p)*(1+oldT+(2+oldT)*num(oldCfg.fee)));
+    if(num(l.ct.hold)!==oldH || (Math.abs(num(l.ct.tp)-exactOld)>.011 && Math.abs(num(l.ct.tp)-legacyOld)>.011)) return;
+    stampNewLot(b,l);
+    l.ct.contractMigrated=true;
+    l.ct.contractSource='repair-added-ticker-placeholder-2026-08-10';
+    n++;
+  });
+  return n;
+}
 async function loadRelease(k){
   if(!syncReady()){ toast('설정 탭에서 구글시트 연동을 먼저 완료하세요'); return; }
   const btn=document.querySelector('[data-relload="'+k+'"]');
@@ -975,6 +1005,7 @@ async function loadRelease(k){
     if(!r || !r.entry || !r.entry.data) throw new Error('시트에 '+k+' 검증본이 없습니다 — 백테스터에서 [검증본으로 확정]을 먼저 실행하세요');
     const rel=JSON.parse(r.entry.data);
     const b=S.books[k], p=rel.parameters||{};
+    const repairOld=isLegacyAddedTickerPlaceholder(b)?Object.assign({},b):null;
     const map=[['aggrTarget','aggrTarget'],['aggrHold','aggrDays'],['safeTarget','safeTarget'],['safeHold','safeDays'],
       ['buyCap','buyLimitPct'],['sellDayBuyRule','sellDayBuyRule'],['splits','splits'],
       ['rsiPeriod','rsiPeriod'],['rsiUpper','rsiUpper'],['rsiLower','rsiLower'],
@@ -990,6 +1021,9 @@ async function loadRelease(k){
     let vxnDiff=null;
     if(p.vxnEnabled!==undefined && (!!p.vxnEnabled)!==(!!b.vxnOn)) vxnDiff=`vxnOn: ${!!b.vxnOn} → ${!!p.vxnEnabled}`;
     if(vxnDiff) diffs.push(vxnDiff);
+    if(p.rsiSource && String(p.rsiSource).toUpperCase()!==String(b.rsiSource||'').toUpperCase())
+      diffs.push(`rsiSource: ${b.rsiSource||''} → ${String(p.rsiSource).toUpperCase()}`);
+    if(p.defaultMode && p.defaultMode!==b.baseMode) diffs.push(`baseMode: ${b.baseMode} → ${p.defaultMode}`);
     const head=`검증본 ${rel.strategyHashShort} (${(rel.verifiedAt||'').slice(0,10)} · ${rel.dataStart||''}~${rel.dataThrough||''})\n`
       +(rel.results? `백테스트: CAGR ${(rel.results.cagr*100).toFixed(1)}% · MDD ${(rel.results.mdd*100).toFixed(1)}%\n`:'');
     if(!diffs.length){
@@ -1002,9 +1036,13 @@ async function loadRelease(k){
     if(!confirm(head+'\n변경될 파라미터 (신규 로트부터 적용, 기존 로트 계약은 불변):\n'+diffs.join('\n')+'\n\n적용할까요?')){ restore(); return; }
     for(const [pk,bk] of map){ if(p[pk]!==undefined&&p[pk]!==null) b[bk]=num(p[pk]); }
     if(p.vxnEnabled!==undefined) b.vxnOn=!!p.vxnEnabled;
+    if(p.rsiSource) b.rsiSource=String(p.rsiSource).toUpperCase();
+    if(p.defaultMode) b.baseMode=p.defaultMode;
+    const repaired=repairPlaceholderLotContracts(b,repairOld);
+    b.addedGenericDefault=false;
     b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
     await persistLocalState(); renderAll();
-    toast('검증본 '+rel.strategyHashShort+' 적용 — 신규 로트부터 새 조건으로 매수합니다');
+    toast('검증본 '+rel.strategyHashShort+' 적용'+(repaired?` · 잘못 생성된 기존 로트 계약 ${repaired}건 교정`:'')+' — 신규 로트부터 새 조건으로 매수합니다');
     auditNote(b,'release-apply',rel.releaseId+' 변경 '+diffs.length+'건');
     restore();
   }catch(e){ restore(); toast('검증본 불러오기 실패: '+(e.message||e)); }
@@ -1321,7 +1359,7 @@ function renderBook(k){
       <div>${E.sellQty>0? `예상 매도 <b>${E.sellQty}주</b> · 예상 매도금 ${fUSD(E.sellAmt)}` : '오늘 매도 예정 로트가 없습니다'}</div>
       <div class="dl" style="margin-top:10px">
         <dt>매도 로트</dt><dd>${E.sellLots}건 (손실 ${E.lossLots}건)</dd>
-        <dt>현재 모드</dt><dd>${E.mode} · 목표 ${fPct(E.target,1)} / ${E.limit}거래일</dd>
+        <dt>현재 모드</dt><dd>${E.mode}${E.target==null?' · RSI 데이터 대기':' · 목표 '+fPct(E.target,1)+' / '+E.limit+'거래일'}</dd>
         <dt>보유 덩이</dt><dd>${E.lots.length} / ${b.splits}</dd>
       </div>
     </div>
@@ -1568,7 +1606,7 @@ function renderBook(k){
             <dt>주 마감일</dt><dd>${rsiRow? rsiRow.d:'—'}</dd>
             <dt>전환 신호</dt><dd>${rsiRow&&rsiRow.sig? rsiRow.sig:'유지'}</dd>
             <dt>적용 시작일</dt><dd>${rsiRow? rsiRow.apply:'—'}</dd>
-            <dt>목표수익률</dt><dd>${fPct(E.target,1)}</dd>
+            <dt>목표수익률</dt><dd>${E.target==null?'—':fPct(E.target,1)}</dd>
             <dt>최대 보유일</dt><dd>${E.limit} 거래일</dd>
           </div>
         </div>
@@ -1910,11 +1948,15 @@ function renderSet(){
     if(['OV','SET','VXN','USDKRW'].includes(k)){ toast('사용할 수 없는 이름입니다'); return; }
     if(S.books[k]){ toast(k+' 모듈이 이미 있습니다'); return; }
     S.books[k]=newBook({ticker:k, rsiSource:'QQQ', seedKRW:0, seedUSD:0,
-      weekly:[], lots:[], records:[]});
+      weekly:[], lots:[], records:[], addedGenericDefault:true});
     await persistLocalState(); renderAll();
     auditNote(S.books[k],'module-add',k);
-    toast(k+' 모듈을 추가했습니다 — ② 전략 파라미터에서 시드·목표수익률을 설정하세요');
     const tab=$$('.tab').find(t=>t.dataset.p===k.toLowerCase()); if(tab) tab.click();
+    toast(k+' 모듈 추가 — 시세·'+S.books[k].rsiSource+' RSI 데이터를 수집합니다');
+    // 새 모듈은 추가 즉시 자체 종가와 RSI 원천 데이터를 확보한다.
+    // 검증본이 있으면 사용자가 바로 적용할 수 있도록 이어서 확인한다.
+    try{ await fetchPrices(true); }catch(e){}
+    if(syncReady()) setTimeout(()=>loadRelease(k),50);
   };
   $$('[data-bookdel]').forEach(el=> el.onclick=async()=>{
     const k=el.dataset.bookdel;
@@ -2120,8 +2162,19 @@ function applyQuote(j,src){
     }
     (S.holdings||[]).forEach(o=>{ if(o.t===k) o.p=q.last; });
   }
+  // RSI 원천 일봉 → 주간 종가 자동 변환. 새 티커도 QQQ(또는 지정 rsiSource)를 자동으로 받는다.
+  if(j.series){
+    bookKeys().forEach(k=>{
+      const b=S.books[k], src=String(b.rsiSource||'').trim().toUpperCase();
+      const ser=src && j.series[src];
+      if(Array.isArray(ser) && ser.length){
+        const wk=dailySeriesToWeekly(ser);
+        if(wk.length) b.weekly=wk.slice(-160);
+      }
+    });
+  }
   // VXN 시계열 반영
-  if(j.series && j.series.VXN && j.series.VXN.length){
+  if(j.series && Array.isArray(j.series.VXN) && j.series.VXN.length){
     const vs=j.series.VXN.map(r=>({d:String(r[0]).slice(0,10), c:+r[1]})).filter(x=>x.c>0);
     bookKeys().forEach(k=>{ S.books[k].vxnSeries=vs.slice(-400); });
   }
@@ -2150,12 +2203,31 @@ function autoRecord(k,q){
   if(n) b.records.sort((a,c)=> a.d<c.d?-1:1);
   return n;
 }
-function quoteTickers(){
-  const t=[...bookKeys(),...(S.holdings||[]).map(o=>o.t).filter(Boolean)];
+function quoteSeriesIds(){
+  const t=bookKeys().map(k=>String(S.books[k].rsiSource||'').trim().toUpperCase()).filter(Boolean);
   if(bookKeys().some(k=>S.books[k].vxnOn)) t.push('VXN');
   return [...new Set(t)];
 }
-function quoteUrl(){ return hubUrl({mode:'quote', ids:quoteTickers().join(','), n:400}); }
+function quoteTickers(){
+  // 거래대상뿐 아니라 RSI 판정의 원천 종목도 반드시 함께 수집한다.
+  const t=[...bookKeys(),...(S.holdings||[]).map(o=>o.t).filter(Boolean),...quoteSeriesIds()];
+  return [...new Set(t.map(x=>String(x).trim().toUpperCase()).filter(Boolean))];
+}
+function quoteUrl(){ return hubUrl({mode:'quote', ids:quoteTickers().join(','), seriesIds:quoteSeriesIds().join(','), n:600}); }
+function dailySeriesToWeekly(rows){
+  const a=(rows||[]).map(r=>({d:String(r[0]||'').slice(0,10), c:+r[1]}))
+    .filter(x=>/^\d{4}-\d{2}-\d{2}$/.test(x.d)&&x.c>0)
+    .sort((x,y)=>x.d<y.d?-1:x.d>y.d?1:0);
+  const by={};
+  for(const x of a){
+    const [yy,mm,dd]=x.d.split('-').map(Number);
+    const d=new Date(Date.UTC(yy,mm-1,dd)), day=d.getUTCDay();
+    const add=(5-day+7)%7; // 해당 거래일이 속한 주의 금요일
+    const f=new Date(d.getTime()+add*86400000).toISOString().slice(0,10);
+    by[f]=x.c; // 월~금 중 가장 늦은 실제 거래일 종가가 남는다(금요일 휴장도 처리)
+  }
+  return Object.keys(by).sort().map(d=>({d,c:by[d]}));
+}
 function jsonp(url, ms){
   return new Promise((res,rej)=>{
     const cb='__q'+Math.random().toString(36).slice(2);
@@ -2309,7 +2381,7 @@ const REL_MAP = [   // [검증본 파라미터 키, book 필드, 표시명]
   ['aggrTarget','aggrTarget','[공세] 목표'], ['aggrHold','aggrDays','[공세] 보유일'],
   ['safeTarget','safeTarget','[안전] 목표'], ['safeHold','safeDays','[안전] 보유일'],
   ['buyCap','buyLimitPct','매수 제한 상승률'], ['sellDayBuyRule','sellDayBuyRule','매도일 매수금지'],
-  ['rsiPeriod','rsiPeriod','RSI 기간'], ['rsiUpper','rsiUpper','RSI 상단'], ['rsiLower','rsiLower','RSI 하단'],
+  ['rsiSource','rsiSource','RSI 기준 종목'], ['rsiPeriod','rsiPeriod','RSI 기간'], ['rsiUpper','rsiUpper','RSI 상단'], ['rsiLower','rsiLower','RSI 하단'],
   ['defaultMode','baseMode','기준 모드'],
   ['vxnEnabled','vxnOn','VXN 사용'],
   ['vxnStableThreshold','vxnCalm','VXN 안정'], ['vxnCautionThreshold','vxnWarn','VXN 경계'],
@@ -2324,11 +2396,13 @@ async function reviewRelease(k){
     if(el) el.textContent='검증본 확인 중…';
     const rel=await fetchRelease(k);
     const b=S.books[k], pr=rel.parameters||{};
+    const repairOld=isLegacyAddedTickerPlaceholder(b)?Object.assign({},b):null;
     const diffs=REL_MAP.filter(([rk,bk])=>{
       const rv=pr[rk], bv=b[bk];
-      if(typeof bv==='boolean'||typeof rv==='boolean'||rv===0||rv===1&&typeof b[bk]==='boolean')
-        return (!!rv)!==(!!bv);
-      return String(rv)!==String(num(bv));
+      if(rv===undefined) return false;
+      if(typeof bv==='boolean'||typeof rv==='boolean'||(rv===0||rv===1)&&typeof b[bk]==='boolean') return (!!rv)!==(!!bv);
+      if(typeof rv==='string' && isNaN(+rv)) return String(rv)!==String(bv);
+      return Math.abs(num(rv)-num(bv))>1e-12;
     });
     const head=`검증본 ${rel.releaseId||''}\n지문 ${rel.strategyHashShort} · ${String(rel.verifiedAt||'').slice(0,10)}`
       + `\n백테스트: ${String(rel.dataStart||'')}~${String(rel.dataThrough||'')}`
@@ -2344,13 +2418,15 @@ async function reviewRelease(k){
       if(el) el.textContent='적용 안 함 — 현재 설정 유지 (미검증)'; return;
     }
     diffs.forEach(([rk,bk])=>{
-      const rv=(REL_MAP.find(x=>x[0]===rk)||[])[1];
       b[bk] = (typeof b[bk]==='boolean') ? !!pr[rk] : (isNaN(+pr[rk])? pr[rk] : +pr[rk]);
     });
+    if(pr.rsiSource) b.rsiSource=String(pr.rsiSource).toUpperCase();
+    const repaired=repairPlaceholderLotContracts(b,repairOld);
+    b.addedGenericDefault=false;
     b.appliedRelease={strategyHashShort:rel.strategyHashShort, releaseId:rel.releaseId, appliedAt:new Date().toISOString()};
     touch(); renderBook(k);
     auditNote(k,'apply-release', rel.releaseId||rel.strategyHashShort);
-    toast('검증본을 적용했습니다 — 기존 로트 계약은 유지, 신규 로트부터 반영');
+    toast('검증본을 적용했습니다'+(repaired?` · 잘못 생성된 기존 로트 계약 ${repaired}건 교정`:'')+' — 신규 로트부터 반영');
   }catch(e){ if(el) el.textContent=e.message; }
 }
 
