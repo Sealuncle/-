@@ -265,7 +265,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
-const APP_BUILD='console-2.0.2-core1';
+const APP_BUILD='console-2.0.4-core1';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -1324,10 +1324,32 @@ function snapshot(force){
 function fld(key,label,val,attr){ return `<label class="f"><span class="l">${label}</span>
   <input data-b="${key}" value="${val}" ${attr||''}></label>`; }
 
+const REC_MONTH_VIEW = Object.create(null);
+function recordMonthKey(d){
+  const v=String(d||'');
+  return /^\d{4}-\d{2}/.test(v)? v.slice(0,7) : todayISO().slice(0,7);
+}
+function getRecordMonth(k){
+  const m=REC_MONTH_VIEW[k];
+  if(/^\d{4}-\d{2}$/.test(m||'')) return m;
+  return (REC_MONTH_VIEW[k]=todayISO().slice(0,7));
+}
+function moveRecordMonth(k,delta){
+  const m=getRecordMonth(k), a=m.split('-').map(Number);
+  let idx=a[0]*12+(a[1]-1)+delta;
+  const y=Math.floor(idx/12), mo=((idx%12)+12)%12+1;
+  REC_MONTH_VIEW[k]=`${y}-${String(mo).padStart(2,'0')}`;
+  return REC_MONTH_VIEW[k];
+}
+
 function renderBook(k){
   const b=S.books[k], E=engine(b), L=E.ladder, fx=S.fx||1;
-  const modeBadge = E.mode==='안전'? `<span class="badge s">안전</span>` : `<span class="badge a">공세</span>`;
+  const modeBadge = E.mode==='안전'? `<span class="badge s">안전</span>`
+                  : E.mode==='공세'? `<span class="badge a">공세</span>`
+                  : `<span class="badge" style="color:var(--warn);border-color:var(--warn)">판정대기</span>`;
   const rsiRow = E.rsi.row;
+  const recMonth=getRecordMonth(k);
+  const recMonthCount=(b.records||[]).filter(r=>recordMonthKey(r.d)===recMonth).length;
 
   $('#p-'+k.toLowerCase()).innerHTML = `
   <div class="eyebrow"><span>${k} · 2-Mode LOC Trading</span><span>${todayISO()}</span></div>
@@ -1478,20 +1500,30 @@ function renderBook(k){
 
   <!-- ⑥ 일별 매매 기록 -->
   <div class="sec">
-    <div class="sec-h"><span class="n">⑥</span><h2>일별 매매 기록</h2><span class="hint">${(b.records||[]).length} 일</span></div>
+    <div class="sec-h"><span class="n">⑥</span><h2>일별 매매 기록</h2>
+      <span class="hint">${recMonth} · ${recMonthCount}일 / 전체 ${(b.records||[]).length}일</span></div>
     <div class="card">
+      <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px">
+        <label class="f" style="width:180px;max-width:100%"><span class="l">조회 월</span>
+          <input type="month" id="rm-${k}" value="${recMonth}"></label>
+        <div class="btnrow" style="margin:0">
+          <button class="btn sm g" data-rprev="${k}">← 이전 달</button>
+          <button class="btn sm g" data-rtoday="${k}">이번 달</button>
+          <button class="btn sm g" data-rnext="${k}">다음 달 →</button>
+        </div>
+      </div>
       <div class="fgrid c3">
-        <label class="f"><span class="l">날짜</span><input type="date" id="rd-${k}" value="${todayISO()}"></label>
+        <label class="f"><span class="l">날짜</span><input type="date" id="rd-${k}" value="${recMonth===todayISO().slice(0,7)?todayISO():recMonth+'-01'}"></label>
         <label class="f"><span class="l">종가 ($)</span><input id="rc-${k}" value="${E.prevClose||''}"></label>
         <label class="f"><span class="l">매수 / 매도 수량</span>
           <div style="display:flex;gap:8px"><input id="rb-${k}" placeholder="매수" value="0"><input id="rs-${k}" placeholder="매도" value="0"></div></label>
       </div>
-      <div class="btnrow"><button class="btn sm" data-radd="${k}">기록 추가</button></div>
-      <div class="tw" style="margin-top:14px"><table style="min-width:620px">
+      <div class="btnrow"><button class="btn sm" data-radd="${k}">기록 저장</button></div>
+      <div class="tw" style="margin-top:14px"><table style="min-width:720px">
         <thead><tr><th>날짜</th><th>종가</th><th>매수</th><th>매도</th><th>매수금</th><th>매도금</th><th>누적 보유</th><th></th></tr></thead>
-        <tbody>${recRows(k,b)}</tbody>
+        <tbody>${recRows(k,b,recMonth)}</tbody>
       </table></div>
-      <div class="note">이 기록이 ① 투자 요약의 예수금·보유수량·손익 계산 근거입니다. 매매가 없는 날은 입력하지 않아도 됩니다.</div>
+      <div class="note">선택한 달의 기록만 표시합니다. <b>불러오기</b>를 누르면 해당 날짜 기록이 입력칸에 채워지며, 수정 후 <b>기록 저장</b>을 누르면 같은 날짜 기록을 덮어씁니다. 누적 보유수량은 이전 달 기록까지 포함해 계산됩니다.</div>
     </div>
   </div>
 
@@ -1607,7 +1639,7 @@ function renderBook(k){
             <dt>전환 신호</dt><dd>${rsiRow&&rsiRow.sig? rsiRow.sig:'유지'}</dd>
             <dt>적용 시작일</dt><dd>${rsiRow? rsiRow.apply:'—'}</dd>
             <dt>목표수익률</dt><dd>${E.target==null?'—':fPct(E.target,1)}</dd>
-            <dt>최대 보유일</dt><dd>${E.limit} 거래일</dd>
+            <dt>최대 보유일</dt><dd>${E.limit==null?'—':E.limit+' 거래일'}</dd>
           </div>
         </div>
         <div class="fgrid" style="grid-template-columns:1fr 1fr">
@@ -1627,17 +1659,24 @@ function renderBook(k){
   bindBook(k);
 }
 
-function recRows(k,b){
+function recRows(k,b,month){
   const rs=(b.records||[]).slice().sort((a,c)=> a.d<c.d?-1:1);
   if(!rs.length) return `<tr><td colspan="8" class="empty">기록이 없습니다</td></tr>`;
-  let acc=0;
-  return rs.map((r,i)=>{ acc+=num(r.buy)-num(r.sell);
-    return `<tr><td style="text-align:left">${esc(r.d)}${r.auto?' <span style="font-size:9px;color:var(--tx3);border:1px solid var(--line);border-radius:4px;padding:1px 4px">자동</span>':''}</td><td>${fUSD(num(r.close))}</td>
+  let acc=0, rows=[];
+  rs.forEach(r=>{
+    acc+=num(r.buy)-num(r.sell); // 이전 달까지 포함한 누적 보유수량
+    if(recordMonthKey(r.d)!==month) return;
+    rows.push(`<tr><td style="text-align:left">${esc(r.d)}${r.auto?' <span style="font-size:9px;color:var(--tx3);border:1px solid var(--line);border-radius:4px;padding:1px 4px">자동</span>':''}</td><td>${fUSD(num(r.close))}</td>
       <td class="up">${num(r.buy)||'—'}</td><td class="down">${num(r.sell)||'—'}</td>
       <td>${fUSD(num(r.buy)*num(r.close))}</td><td>${fUSD(num(r.sell)*num(r.close))}</td>
       <td>${fNum(acc)}주</td>
-      <td><button class="btn sm dg" data-rdel="${k}:${esc(r.d)}">삭제</button></td></tr>`;
-  }).reverse().join('');
+      <td><div class="btnrow" style="margin:0;justify-content:flex-end;flex-wrap:nowrap">
+        <button class="btn sm g" data-rload="${k}:${esc(r.d)}">불러오기</button>
+        <button class="btn sm dg" data-rdel="${k}:${esc(r.d)}">삭제</button>
+      </div></td></tr>`);
+  });
+  if(!rows.length) return `<tr><td colspan="8" class="empty">${esc(month)} 기록이 없습니다</td></tr>`;
+  return rows.reverse().join('');
 }
 
 function bindBook(k){
@@ -1758,18 +1797,40 @@ function bindBook(k){
       if(manual) rec.man=1;
       bb.records.push(rec);
       bb.records.sort((a,c)=> a.d<c.d?-1:1);
+      REC_MONTH_VIEW[k]=recordMonthKey(rr.d);
       touch(); renderBook(k);
       auditNote(k, 'settle', `${rr.d} 매수 ${actN}(계획 ${rr.N}) 매도 ${actS}(계획 ${rr.S})${manual?' · 수동수정':''}`);
       toast(`정산 완료 · 매수 ${actN}주 / 매도 ${actS}주 반영${manual?' (수동 수정됨)':''}`);
     });
     $$('[data-stclear]',box).forEach(x=> x.onclick=()=>{ box.innerHTML=''; });
   });
+  const monthInput=$('#rm-'+k);
+  if(monthInput) monthInput.onchange=()=>{
+    if(/^\d{4}-\d{2}$/.test(monthInput.value||'')) REC_MONTH_VIEW[k]=monthInput.value;
+    renderBook(k);
+  };
+  $$('[data-rprev]',root).forEach(el=> el.onclick=()=>{ moveRecordMonth(k,-1); renderBook(k); });
+  $$('[data-rnext]',root).forEach(el=> el.onclick=()=>{ moveRecordMonth(k, 1); renderBook(k); });
+  $$('[data-rtoday]',root).forEach(el=> el.onclick=()=>{ REC_MONTH_VIEW[k]=todayISO().slice(0,7); renderBook(k); });
+  $$('[data-rload]',root).forEach(el=> el.onclick=()=>{
+    const [bk,d]=el.dataset.rload.split(':');
+    const r=(S.books[bk].records||[]).find(x=>x.d===d); if(!r) return toast('기록을 찾지 못했습니다');
+    $('#rd-'+bk).value=r.d; $('#rc-'+bk).value=num(r.close)||'';
+    $('#rb-'+bk).value=num(r.buy); $('#rs-'+bk).value=num(r.sell);
+    const dateEl=$('#rd-'+bk); if(dateEl) dateEl.focus();
+    toast(`${d} 기록을 불러왔습니다 · 수정 후 기록 저장`);
+  });
   $$('[data-radd]',root).forEach(el=> el.onclick=()=>{
     const d=$('#rd-'+k).value, c=num($('#rc-'+k).value);
     if(!d||!c) return toast('날짜와 종가를 입력하세요');
+    const existed=(S.books[k].records||[]).some(r=>r.d===d);
     S.books[k].records = (S.books[k].records||[]).filter(r=>r.d!==d);
     S.books[k].records.push({d, close:c, buy:num($('#rb-'+k).value), sell:num($('#rs-'+k).value)});
-    S.books[k].prevClose = c; touch(); renderBook(k); toast('기록을 추가했습니다'); });
+    S.books[k].records.sort((a,c)=> a.d<c.d?-1:a.d>c.d?1:0);
+    REC_MONTH_VIEW[k]=recordMonthKey(d);
+    const latest=S.books[k].records[S.books[k].records.length-1];
+    if(latest && latest.d===d) S.books[k].prevClose=c;
+    touch(); renderBook(k); toast(existed?'기록을 수정했습니다':'기록을 추가했습니다'); });
   $$('[data-rdel]',root).forEach(el=> el.onclick=()=>{
     const [bk,d]=el.dataset.rdel.split(':');
     S.books[bk].records=S.books[bk].records.filter(r=>r.d!==d); touch(); renderBook(bk); });
@@ -1950,7 +2011,7 @@ function renderSet(){
     S.books[k]=newBook({ticker:k, rsiSource:'QQQ', seedKRW:0, seedUSD:0,
       weekly:[], lots:[], records:[], addedGenericDefault:true});
     await persistLocalState(); renderAll();
-    auditNote(S.books[k],'module-add',k);
+    auditNote(k,'module-add',k);
     const tab=$$('.tab').find(t=>t.dataset.p===k.toLowerCase()); if(tab) tab.click();
     toast(k+' 모듈 추가 — 시세·'+S.books[k].rsiSource+' RSI 데이터를 수집합니다');
     // 새 모듈은 추가 즉시 자체 종가와 RSI 원천 데이터를 확보한다.
@@ -2162,6 +2223,14 @@ function applyQuote(j,src){
     }
     (S.holdings||[]).forEach(o=>{ if(o.t===k) o.p=q.last; });
   }
+  // 거래대상 일봉으로 누락된 0/0 세션을 먼저 복구한다.
+  // 실제 체결/수동 기록이 이미 있는 날짜는 backfillAutoRecords()가 건드리지 않는다.
+  if(j.series){
+    bookKeys().forEach(k=>{
+      const own=j.series[k];
+      if(Array.isArray(own) && own.length) autoAdded += backfillAutoRecords(k, own);
+    });
+  }
   // RSI 원천 일봉 → 주간 종가 자동 변환. 새 티커도 QQQ(또는 지정 rsiSource)를 자동으로 받는다.
   if(j.series){
     bookKeys().forEach(k=>{
@@ -2203,10 +2272,36 @@ function autoRecord(k,q){
   if(n) b.records.sort((a,c)=> a.d<c.d?-1:1);
   return n;
 }
+/** 아카이브 일봉으로 기록 공백을 보충한다.
+    - 기존 실제/수동 기록은 절대 덮어쓰지 않는다.
+    - 해당 모듈의 최초 기록일 이후 세션만 0/0 자동 기록으로 채운다.
+    - 따라서 모듈 추가 전의 긴 과거 이력이 원장에 유입되지 않는다. */
+function backfillAutoRecords(k, rows){
+  const b=S.books[k]; if(!b) return 0;
+  b.records=b.records||[];
+  const a=(rows||[]).map(r=>({d:String(r[0]||'').slice(0,10), c:+r[1]}))
+    .filter(x=>/^\d{4}-\d{2}-\d{2}$/.test(x.d)&&x.c>0)
+    .sort((x,y)=>x.d<y.d?-1:x.d>y.d?1:0);
+  if(!a.length) return 0;
+  const cutoff=lastCompletedUsSession();
+  // autoRecord()가 먼저 실행되므로 신규 모듈도 보통 직전/최근 세션 1~2개가 이미 있다.
+  const firstExisting=(b.records||[]).filter(r=>r.d).map(r=>r.d).sort()[0] || a[a.length-1].d;
+  const have=new Set((b.records||[]).filter(r=>r.d).map(r=>r.d));
+  let n=0;
+  for(const x of a){
+    if(x.d<firstExisting || x.d>cutoff || have.has(x.d)) continue;
+    b.records.push({d:x.d, close:x.c, buy:0, sell:0, auto:true});
+    have.add(x.d); n++;
+  }
+  if(n) b.records.sort((x,y)=>x.d<y.d?-1:x.d>y.d?1:0);
+  return n;
+}
+
 function quoteSeriesIds(){
-  const t=bookKeys().map(k=>String(S.books[k].rsiSource||'').trim().toUpperCase()).filter(Boolean);
+  // 거래대상 자체의 일봉도 요청한다. 앱을 며칠 열지 않았더라도 누락 세션을 자동 복구하기 위함.
+  const t=[...bookKeys(), ...bookKeys().map(k=>String(S.books[k].rsiSource||'').trim().toUpperCase()).filter(Boolean)];
   if(bookKeys().some(k=>S.books[k].vxnOn)) t.push('VXN');
-  return [...new Set(t)];
+  return [...new Set(t.map(x=>String(x).trim().toUpperCase()).filter(Boolean))];
 }
 function quoteTickers(){
   // 거래대상뿐 아니라 RSI 판정의 원천 종목도 반드시 함께 수집한다.
