@@ -265,7 +265,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
-const APP_BUILD='console-2.0.4-core1';
+const APP_BUILD='console-2.0.5-quotes';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -353,12 +353,35 @@ function networkDays(a,b){
 /* ── 미국 거래 세션 시계 ─────────────────────────────────
    기준 종가 = "완료된 마지막 미국 세션"의 종가.
    ET 16:05 이전에는 당일 세션이 미완료이므로 전 거래일이 기준. */
+// 정규 휴장일. 임시 휴장은 YYYY-MM-DD를 EXTRA_US_HOLIDAYS에 추가한다.
+var EXTRA_US_HOLIDAYS = ['2025-01-09'];
+function isUsTradingDay_(d) {
+  var y=d.getFullYear(), m=d.getMonth(), day=d.getDate(), w=d.getDay();
+  if(w===0 || w===6) return false;
+  var iso=y+'-'+('0'+(m+1)).slice(-2)+'-'+('0'+day).slice(-2);
+  if(EXTRA_US_HOLIDAYS.indexOf(iso)>=0) return false;
+  function observed(month, date, saturday) {
+    var x=new Date(y,month,date,12);
+    if(x.getDay()===6 && saturday!==false) x.setDate(x.getDate()-1);
+    if(x.getDay()===0) x.setDate(x.getDate()+1);
+    return m===x.getMonth() && day===x.getDate();
+  }
+  if(observed(0,1,false) || observed(6,4) || observed(11,25) || (y>=2022 && observed(5,19))) return false;
+  if(w===1 && ((m===0 && day>=15 && day<=21) || (m===1 && day>=15 && day<=21) || (m===4 && day>=25) || (m===8 && day<=7))) return false;
+  if(m===10 && w===4 && day>=22 && day<=28) return false;
+  var a=y%19,b=Math.floor(y/100),c=y%100,e=Math.floor(b/4),f=Math.floor((b+8)/25),
+      gg=Math.floor((b-f+1)/3),hh=(19*a+b-e-gg+15)%30,i=Math.floor(c/4),k=c%4,
+      l=(32+2*(b%4)+2*i-hh-k)%7,n=Math.floor((a+11*hh+22*l)/451),z=hh+l-7*n+114;
+  var friday=new Date(y,Math.floor(z/31)-1,z%31+1,12); friday.setDate(friday.getDate()-2);
+  return !(m===friday.getMonth() && day===friday.getDate());
+}
+
 function usEasternNow(){
   const p=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',
     year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})
     .formatToParts(new Date());
   const g=t=>+p.find(x=>x.type===t).value;
-  return {y:g('year'),m:g('month'),d:g('day'),H:g('hour'),M:g('minute')};
+  return {y:g('year'),m:g('month'),d:g('day'),H:(g('hour')%24),M:g('minute')};
 }
 const fmtD=dt=>dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
 function lastCompletedUsSession(){
@@ -366,7 +389,7 @@ function lastCompletedUsSession(){
   const closed=(n.H>16)||(n.H===16&&n.M>=5);        // 16:05 버퍼
   let dt=new Date(n.y,n.m-1,n.d,12);
   if(!closed) dt.setDate(dt.getDate()-1);
-  while(dt.getDay()===0||dt.getDay()===6) dt.setDate(dt.getDate()-1);
+  while(!isUsTradingDay_(dt)) dt.setDate(dt.getDate()-1);
   return fmtD(dt);
 }
 function targetUsSession(){                          // 지금 낼 주문이 체결될 세션
@@ -374,7 +397,7 @@ function targetUsSession(){                          // 지금 낼 주문이 체
   const closed=(n.H>16)||(n.H===16&&n.M>=5);
   let dt=new Date(n.y,n.m-1,n.d,12);
   if(closed) dt.setDate(dt.getDate()+1);
-  while(dt.getDay()===0||dt.getDay()===6) dt.setDate(dt.getDate()+1);
+  while(!isUsTradingDay_(dt)) dt.setDate(dt.getDate()+1);
   return fmtD(dt);
 }
 
@@ -1888,7 +1911,7 @@ function renderSet(){
           <textarea id="pasteIn" placeholder='{"fx":1469.4,"prices":{"SOXL":{"price":160.99,"prev":158.54}}}'></textarea></label>
         <div class="btnrow"><button class="btn sm" id="pasteGo">붙여넣은 값 적용</button></div>
       </div>
-      <div class="note" id="fetchNote">시트의 GOOGLEFINANCE 값을 그대로 가져옵니다. 미국 주식 시세는 약 20분 지연이며, 장중에는 전일 종가가 <b>전 거래일 종가</b>로 고정됩니다.</div>
+      <div class="note" id="fetchNote">저장된 종가의 거래일을 검사하고 누락·지연 종목을 재수집합니다. 미국 주식 시세는 약 20분 지연이며, 장중에는 전일 종가가 <b>전 거래일 종가</b>로 고정됩니다.</div>
     </div>
   </div>
 
@@ -2205,6 +2228,19 @@ function renderSet(){
 }
 
 /* ── 시세 조회 : 직접 fetch → JSONP → 수동 붙여넣기 ───────── */
+function outdatedQuoteIds(j){
+  const cut=lastCompletedUsSession();
+  return quoteTickers().filter(t=>{
+    const q=j && j.prices && j.prices[t];
+    return !q || !(+q.lastClose>0) || q.lastCloseDate!==cut;
+  });
+}
+function requireCurrentQuotes(j){
+  const stale=outdatedQuoteIds(j);
+  if(stale.length) throw new Error('최신 종가 미수신 ('+lastCompletedUsSession()+'): '+stale.join(', '));
+  return j;
+}
+
 function applyQuote(j,src){
   if(!j || !j.prices) throw new Error('응답에 prices 가 없습니다');
   if(+j.fx>0) S.fx=+j.fx;
@@ -2564,9 +2600,9 @@ async function hubGet(url){
 async function hubCollect(id, prog){
   const p=await hubGet(hubUrl({mode:'prepare', id, ticker:id, years:3}));
   if(p.ok===false) throw new Error(p.error||'prepare 실패');
-  for(let i=0;i<12;i++){
+  for(let i=0;i<20;i++){
     await new Promise(r=>setTimeout(r, i===0?3000:2500));
-    if(prog) prog(`${id} 수집 중… (${i+1}/12)`);
+    if(prog) prog(`${id} 수집 중… (${i+1}/20)`);
     const c=await hubGet(hubUrl({mode:'collect', id, n:400}));
     if(c.done) return {ok:true, rows:c.rows, resolved:c.resolved};
     if(c.ok===false) return {ok:false, error:c.error||'수집 실패', diag:c.diag||''};
@@ -2596,8 +2632,9 @@ async function fetchPrices(silent){
   };
   let log=diagLine(true,'앱 버전', APP_BUILD+' — 이 줄이 안 보이면 옛 파일이 캐시된 것입니다');
   const hasGs=!!S.gsUrl, hasTd=!!S.tdKey;
+  let hubData=null;
   if(!hasGs && !hasTd){
-    log+=diagLine(false,'소스 없음','구글시트 URL 또는 Twelve Data 키 중 하나를 등록하면 정확한 확정 종가를 받습니다. AI 조회로 진행합니다.');
+    log+=diagLine(false,'소스 없음','구글시트 URL 또는 Twelve Data 키 중 하나를 등록하면 정확한 확정 종가를 받습니다. 설정 후 다시 갱신하세요.');
   }
   if(hasGs && !/\/exec(\?|$)/.test(S.gsUrl))
     log+=diagLine(false,'URL 형식','/exec 로 끝나야 합니다. /dev 주소는 본인만 접근됩니다');
@@ -2608,17 +2645,18 @@ async function fetchPrices(silent){
       let j=await hubGet(quoteUrl());
       if(j.ok===false) throw new Error(j.error);
       const want=quoteTickers();
-      let missing=want.filter(t=> !(j.prices && j.prices[t]));
+      let missing=outdatedQuoteIds(j);
       if(missing.length){
-        log+=diagLine(true,'초기 수집', missing.join(', ')+' — 시트에 종가 이력을 모으는 중입니다 (처음 한 번, 종목당 10~30초)');
+        log+=diagLine(true,'누락·지연 종가 재수집', missing.join(', ')+' — 시트에 종가 이력을 모으는 중입니다 (종목당 최대 약 60초)');
         if(out) out.innerHTML=log;
         const rs=await hubCollectAll(missing, m=>{ if(out) out.innerHTML=log+diagLine(true,'진행', m); });
         j=await hubGet(quoteUrl());
-        missing=want.filter(t=> !(j.prices && j.prices[t]));
-        log+=diagLine(rs.fail.length===0, '초기 수집',
+        missing=outdatedQuoteIds(j);
+        log+=diagLine(rs.fail.length===0, '누락·지연 종가 재수집',
           rs.fail.length? '일부 실패: '+rs.fail.join(' / ') : rs.done.join(', ')+' 완료');
       }
-      const n=applyQuote(j,'구글시트');
+      hubData=j;
+      const n=applyQuote(requireCurrentQuotes(j),'구글시트');
       return await ok('구글시트','성공 (아카이브 확정 종가)',n);
     }catch(e){
       const cors=e instanceof TypeError||/fetch/i.test(e.message);
@@ -2628,7 +2666,11 @@ async function fetchPrices(silent){
   // ② Twelve Data (CORS 허용 → 파일/호스팅 환경에서 동작)
   if(hasTd){
     try{
-      const n=applyQuote(await tdQuote(),'Twelve Data');
+      const td=await tdQuote();
+      const combined={fx:td.fx || (hubData && hubData.fx),
+        prices:Object.assign({},hubData && hubData.prices,td.prices),
+        series:Object.assign({},hubData && hubData.series,td.series)};
+      const n=applyQuote(requireCurrentQuotes(combined),'Twelve Data');
       return await ok('Twelve Data','성공 (EOD 확정 종가)',n);
     }catch(e){
       log+=diagLine(false,'Twelve Data', (e instanceof TypeError)?'차단됨 (이 환경에서 외부 접속 불가)':e.message);
@@ -2638,19 +2680,11 @@ async function fetchPrices(silent){
   if(hasGs){
     if(out) out.innerHTML=log+diagLine(true,'JSONP','시도 중…');
     try{
-      const n=applyQuote(await jsonp(quoteUrl(),12000),'구글시트 JSONP');
+      const n=applyQuote(requireCurrentQuotes(await jsonp(quoteUrl(),12000)),'구글시트 JSONP');
       return await ok('구글시트 JSONP','성공 (GOOGLEFINANCE 확정 종가)',n);
     }catch(e){ log+=diagLine(false,'JSONP', e.message); }
   }
-  // ④ AI 웹검색 (아티팩트 전용 최후 수단)
-  if(out) out.innerHTML=log+diagLine(true,'AI 시세 조회','시도 중…');
-  try{
-    const n=applyQuote(await aiQuote(),'AI 조회');
-    return await ok('AI 시세 조회','성공 — 아래 표의 거래일을 꼭 확인하세요',n);
-  }catch(e){
-    log+=diagLine(false,'AI 시세 조회', e.message);
-    log+=`<div class="note" style="margin-top:8px">모든 자동 경로가 막혔습니다. <b>수동 붙여넣기</b>로 진행하세요.</div>`;
-  }
+  log+=diagLine(false,'갱신 미완료','최신 거래일의 종가를 확보하지 못했습니다. 기존 기록을 유지합니다. Google 수집 실패 시 Twelve Data 키를 설정하거나 확정 종가를 수동 입력하세요.');
   DIAG=log; if(out) out.innerHTML=log;
   fin();
 }
@@ -2660,14 +2694,17 @@ async function tdQuote(){
   if(S.tdKey && S.gsToken && S.tdKey===S.gsToken)
     throw new Error('Twelve Data 키 자리에 시트 접근 토큰이 들어 있습니다 — 설정에서 확인하세요');
   const t=quoteTickers().filter(x=>x!=='VXN'&&x!=='USDKRW');
-  const out={fx:0,prices:{}};
+  const out={fx:0,prices:{},series:{}};
   const r=await fetch('https://api.twelvedata.com/time_series?symbol='+encodeURIComponent(t.join(','))
-    +'&interval=1day&outputsize=2&apikey='+encodeURIComponent(S.tdKey));
+    +'&interval=1day&outputsize=600&adjust=none&apikey='+encodeURIComponent(S.tdKey));
   const j=await r.json();
   if(j.status==='error') throw new Error(j.message||'Twelve Data 오류');
   const one = j.values? {[t[0]]:j} : j;                 // 단일 심볼이면 평평한 형태로 옴
   for(const k of Object.keys(one)){
-    const v=one[k]&&one[k].values; if(!v||!v.length) continue;
+    const values=one[k]&&one[k].values; if(!Array.isArray(values)) continue;
+    const v=values.filter(x=>x.datetime<=lastCompletedUsSession() && Number.isFinite(+x.close) && +x.close>0).sort((a,b)=>b.datetime.localeCompare(a.datetime));
+    if(!v.length) continue;
+    out.series[k.toUpperCase()]=v.map(x=>[x.datetime,+x.close]).reverse();
     out.prices[k.toUpperCase()]={
       lastClose:+v[0].close, lastCloseDate:v[0].datetime,
       prevClose:v[1]? +v[1].close:0, prevCloseDate:v[1]? v[1].datetime:'' };
