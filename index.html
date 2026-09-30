@@ -265,7 +265,7 @@ const SEED_TQQQ_REC = [];
 /* ============================================================
    1. 저장소 어댑터  (Claude 아티팩트 storage → localStorage 순)
    ============================================================ */
-const APP_BUILD='console-2.0.6-vxn';
+const APP_BUILD='console-2.1.0-order-plans';
 const KEY = 'lev2mode:v1';
 const Store = {
   mode: 'local',
@@ -655,7 +655,7 @@ async function save(){
   cloudPush();
 }
 let saveTimer=null;
-function touch(){ clearTimeout(saveTimer); saveTimer=setTimeout(save,400); }
+function touch(){ clearTimeout(saveTimer); saveTimer=setTimeout(()=>{saveTimer=null;save();},400); }
 
 /* ============================================================
    3-2. 자동 백업 · 로트 계약 · 세션 계산
@@ -703,6 +703,7 @@ function migrateContracts(){
 
 /** 신규 로트 계약 스탬프 (정확식) */
 function stampNewLot(b, lot){
+  if(!lot.id) lot.id=lotId();
   const t = lot.mode==='안전'? num(b.safeTarget) : num(b.aggrTarget);
   lot.ct = {
     tp  : StrategyCore.calcTargetPrice(num(lot.p), t, num(b.fee), num(b.fee), 'exact'),
@@ -809,7 +810,143 @@ function vxnState(b){
   return {on:true, level, ratio, v, last, prev, stage:cls.stage,
           chg: prev? v-num(prev.c) : null, stale,
           forceSafe: cls.forceSafe,
-          warn: stale>=2? `VXN 기록이 ${stale}거래일 오래됐습니다`:''};
+          warn: last.status==='pending'? 'Yahoo 보충값(미확인)을 계산에 사용 중입니다. 아래 표에서 직접 확인하세요' : (stale>=2? `VXN 기록이 ${stale}거래일 오래됐습니다`:'')};
+}
+
+/* 저장 주문표는 화면 계산과 분리하고 서버의 불변 스냅샷으로 조회한다. */
+const PLAN_VIEW={};
+let PLAN_BUSY=false, PRICE_JOB=null;
+function lotId(){return 'lot_'+(globalThis.crypto?.randomUUID?.()||Date.now().toString(36)+'_'+Math.random().toString(36).slice(2));}
+function ensureLotIds(){
+  const ids=new Set();
+  bookKeys().forEach(k=>(S.books[k].lots||[]).forEach(l=>{if(!l.id || ids.has(l.id))l.id=lotId(); ids.add(l.id);}));
+}
+function planSnapshot(k){
+  const b=S.books[k], E=engine(b);
+  return {schema:1,id:lotId(),ticker:k,date:E.session,prevClose:E.prevClose,prevSource:E.prevSrc,
+    mode:E.mode,fee:num(b.fee),buyQty:E.buyQty,buyLimit:E.buyLimit,
+    buyTarget:E.mode==='안전'?num(b.safeTarget):num(b.aggrTarget),buyHold:E.mode==='안전'?num(b.safeDays):num(b.aggrDays),
+    engineVersion:StrategyCore.ENGINE_VERSION,
+    lots:JSON.parse(JSON.stringify(E.lots.filter(l=>num(l.q)>0))),orders:JSON.parse(JSON.stringify(E.ladder.rows))};
+}
+async function planRun(fn){
+  if(PLAN_BUSY)return;
+  if(!syncReady()||!S.syncLinked) return toast('설정에서 클라우드 받기/저장으로 연동을 먼저 완료하세요');
+  const pending=saveTimer!==null||pushTimer!==null||!!PRICE_JOB, revision=S.cloudSavedAt;
+  PLAN_BUSY=true;
+  document.activeElement?.blur?.();
+  const frozen=[...document.querySelectorAll('.top,nav.tabs,main')].map(el=>({el,inert:el.inert}));
+  frozen.forEach(x=>x.el.inert=true);
+  const cover=document.createElement('div');
+  cover.style.cssText='position:fixed;inset:0;z-index:10000;background:#08090bcc;display:grid;place-items:center;color:white;padding:24px;text-align:center';
+  cover.textContent='구글시트 주문표 처리 중…'; document.body.appendChild(cover);
+  clearTimeout(saveTimer); clearTimeout(pushTimer);saveTimer=null;pushTimer=null;
+  try{
+    await PRICE_JOB; await pushQueue.catch(()=>null); clearTimeout(pushTimer);pushTimer=null;
+    if(pending){S.savedAt=Math.max(Date.now(),num(S.savedAt)+1);await persistLocalState();}
+    await fn();
+  }
+  catch(e){toast(e.message||String(e)); const out=document.querySelector('.page.on [data-plan-error]'); if(out)out.textContent=e.message||String(e);}
+  finally{PLAN_BUSY=false;cover.remove();frozen.forEach(x=>x.el.inert=x.inert);if(pending&&S.cloudSavedAt===revision)cloudPush();}
+}
+async function planRead(k,id){
+  const r=await hubGet(hubUrl({mode:id?'planget':'planlist',ticker:k,planId:id||'',_:Date.now()}));
+  if(!r || r.ok===false || !Array.isArray(r.plans))throw new Error(r?.error||'Apps Script를 새 버전으로 배포하세요 (주문표 API 없음)');
+  const v=PLAN_VIEW[k]||(PLAN_VIEW[k]={}); v.plans=r.plans;
+  if(id){ if(!r.plan)throw new Error('저장된 주문표를 찾지 못했습니다');v.plan=r.plan;v.receipt=r.receipt;v.date=r.plan.date;v.selectedId=id; }
+  else {v.plan=null;v.receipt=null;v.selectedId='';if(!v.date)v.date=r.plans[0]?.date||engine(S.books[k]).session;}
+  return r;
+}
+async function saveOrderPlan(k){return planRun(async()=>{
+  ensureLotIds(); await persistLocalState();
+  await doPush(false,false);
+  const plan=planSnapshot(k);
+  const r=await bridgePost({mode:'plansave',ifmatch:S.cloudSavedAt},JSON.stringify({plan}),async()=>{
+    const g=await hubGet(hubUrl({mode:'planget',ticker:k,planId:plan.id,_:Date.now()}));
+    return g?.plan?.id===plan.id?{ok:true,plan:g.plan}:null;
+  });
+  if(!r?.ok)throw new Error(r?.error||'주문표 저장 실패');
+  await planRead(k,plan.id); renderBook(k); toast(plan.date+' 주문표를 구글시트에 저장했습니다');
+});}
+function planPanel(k){
+  return `<div class="sec"><div class="sec-h"><span class="n">⑧</span><h2>저장 주문표 · 체결 정산</h2></div>
+    <div class="card"><div class="btnrow">
+      <button class="btn" data-plan-save="${k}">오늘 주문표 저장 (${engine(S.books[k]).session})</button>
+      <button class="btn g" data-plan-list="${k}">저장 목록 불러오기</button></div>
+    <div class="note">주문을 내기 전에 저장하세요. 매도표·상계 사다리·매수 계획을 그 시점 그대로 구글시트에 보관합니다. 같은 날 다시 저장하면 이전 버전도 남습니다. 저장하지 않은 과거 주문표는 복원할 수 없습니다.</div>
+    <div data-plan-error style="color:var(--bad);white-space:pre-wrap"></div><div id="plan-view-${k}"></div></div></div>`;
+}
+function renderPlanView(k){
+  const box=$('#plan-view-'+k), v=PLAN_VIEW[k]; if(!box||!v)return;
+  const plans=(v.plans||[]).filter(p=>p.date===v.date), p=v.plan, receipt=v.receipt;
+  box.innerHTML=`<div class="fgrid c3" style="margin-top:16px">
+    <label class="f"><span class="l">미국 거래일</span><input type="date" data-plan-date value="${esc(v.date||'')}"></label>
+    <label class="f"><span class="l">저장 버전 (${plans.length}개)</span><select data-plan-select>${plans.length?plans.map(x=>`<option value="${esc(x.id)}" ${(p?.id||v.selectedId)===x.id?'selected':''}>${esc(new Date(x.createdAt).toLocaleString('ko-KR'))}${x.settled?' · 정산완료':''}</option>`).join(''):'<option value="">저장된 주문표 없음</option>'}</select></label>
+    <label class="f"><span class="l">&nbsp;</span><button class="btn g" data-plan-load>선택 주문표 조회</button></label></div>
+    ${(v.plans||[]).length?`<div class="note">저장된 거래일: ${[...new Set(v.plans.map(x=>x.date))].slice(0,60).map(d=>`<button class="btn sm g" data-plan-day="${esc(d)}">${esc(d)}</button>`).join(' ')}</div>`:'<div class="note">아직 저장된 주문표가 없습니다.</div>'}
+    ${p&&p.date===v.date?`<div class="call hold" style="margin-top:12px"><b>${esc(p.date)} · ${esc(p.ticker)} 저장 주문표</b><br>기준 종가 ${fUSD(p.prevClose)} (${esc(p.prevSource||'')}) · ${esc(p.mode)} · 매수 ${p.buyQty}주 @ ${fUSD(p.buyLimit)}<br><span class="hint">${esc(new Date(p.createdAt).toLocaleString('ko-KR'))} 저장 · 이후 시세나 설정이 바뀌어도 이 표는 바뀌지 않습니다.</span></div>
+    <div class="tw"><table style="min-width:640px"><thead><tr><th>당시 로트</th><th>매수일</th><th>보유수량</th><th>목표가</th><th>보유일/기한</th><th>매도 유형</th></tr></thead><tbody>
+    ${p.lots.map((l,i)=>`<tr><td>#${Number.isInteger(l.i)?l.i+1:i+1}</td><td>${esc(l.d)}</td><td>${l.q}</td><td>${fUSD(l.sp)}</td><td>${l.held}/${l.lim}</td><td>${l.expired?'MOC 기한도래':'LOC 목표가'}</td></tr>`).join('')||'<tr><td colspan="6">보유 로트 없음</td></tr>'}</tbody></table></div>
+    <details style="margin-top:12px"><summary>당시 상계 사다리 주문표</summary><div class="tw"><table><thead><tr><th>구분</th><th>유형</th><th>수량</th><th>가격</th><th>대상 로트</th><th>조건</th></tr></thead><tbody>${p.orders.map(r=>`<tr><td>${esc(r.side)}</td><td>${esc(r.kind)}</td><td>${r.qty}</td><td>${r.price==null?'시장가':fUSD(r.price)}</td><td>${(r.lots||[]).map(l=>`#${l.n} ${l.take}주${l.partial?' (일부)':''} · ${esc(l.d)}`).join('<br>')||(r.side==='매수'?'신규 로트':'—')}</td><td>${esc(r.cond||'')}</td></tr>`).join('')}</tbody></table></div></details>
+    ${receipt?`<div class="call hold" style="margin-top:16px"><b>이 거래일은 정산 완료되었습니다.</b><br>매수 ${receipt.buyQty}주 @ ${fUSD(receipt.buyPrice)} · 매도 ${receipt.sellQty}주 · 매도금액 ${fUSD(receipt.sellAmount)}<br>${esc(receipt.at)}${receipt.planId!==p.id?'<br>같은 날짜의 다른 저장 버전으로 정산했습니다.':''}</div>
+      <div class="tw"><table><thead><tr><th>당시 로트 / 매수일</th><th>매도 체결수량</th><th>체결단가</th></tr></thead><tbody>${receipt.fills.filter(f=>f.qty>0).map(f=>{const l=p.lots.find(x=>x.id===f.lotId);return `<tr><td>${l?'#'+(Number.isInteger(l.i)?l.i+1:p.lots.indexOf(l)+1)+' · '+esc(l.d):esc(f.lotId)}</td><td>${f.qty}</td><td>${fUSD(f.price)}</td></tr>`;}).join('')}</tbody></table></div>`:
+    `<div style="margin-top:18px"><b>당시 체결 내역 입력</b><div class="note">미체결은 0주로 두세요. 일부 매도는 실제 수량만 차감하고 잔량의 매수일·계약을 유지합니다. 과거 거래일부터 순서대로 정산하세요.</div>
+      <label class="f"><span class="l">${esc(p.date)} 확정 종가 ($)</span><input data-plan-close type="number" min="0" step="any" value="${num((S.books[k].records||[]).find(r=>r.d===p.date)?.close)||''}"></label>
+      <div class="tw"><table style="min-width:550px"><thead><tr><th>당시 로트</th><th>매수일 / 수량</th><th>실제 매도수량</th><th>실제 매도단가 ($)</th></tr></thead><tbody>${p.lots.map((l,i)=>`<tr><td>#${Number.isInteger(l.i)?l.i+1:i+1}</td><td>${esc(l.d)} / ${l.q}주</td><td><input type="number" min="0" max="${l.q}" step="1" data-plan-qty="${i}" value="0" style="width:90px"></td><td><input type="number" min="0" step="any" data-plan-price="${i}" placeholder="체결단가" style="width:110px"></td></tr>`).join('')}</tbody></table></div>
+      <div class="fgrid c3"><label class="f"><span class="l">실제 매수수량</span><input data-plan-buy type="number" min="0" step="1" value="0"></label><label class="f"><span class="l">실제 매수단가 ($)</span><input data-plan-bp type="number" min="0" step="any"></label></div>
+      <label style="display:block;margin:12px 0"><input type="checkbox" data-plan-netting> 상계 사다리 정산 (원래 로직의 매수·매도 수량 입력 / 기존 상계 수수료 절감 적용)</label>
+      <div class="btnrow"><button class="btn g" data-plan-suggest>저장 계획 + 종가로 제안 채우기</button><button class="btn" data-plan-preview>정산 미리보기</button></div>
+      <div class="note">제안은 체결 확인이 아닙니다. 증권사 내역과 대조해 수정하세요. 상계 주문은 원래 로직 수량의 순매매(매수−매도)가 증권사 체결과 일치하는지 확인하세요.</div><div data-plan-preview-box></div></div>`}`:''}`;
+  box.querySelector('[data-plan-date]').onchange=e=>{v.date=e.target.value;v.plan=null;v.receipt=null;renderPlanView(k);};
+  box.querySelectorAll('[data-plan-day]').forEach(el=>el.onclick=()=>{v.date=el.dataset.planDay;v.plan=null;v.receipt=null;renderPlanView(k);});
+  box.querySelector('[data-plan-select]').onchange=e=>{v.selectedId=e.target.value;v.plan=null;v.receipt=null;renderPlanView(k);};
+  box.querySelector('[data-plan-load]').onclick=()=>planRun(async()=>{const id=box.querySelector('[data-plan-select]').value;if(!id)throw new Error('해당 거래일에 저장된 주문표가 없습니다');await planRead(k,id);renderPlanView(k);});
+  if(!p||p.date!==v.date||receipt)return;
+  const read=()=>{
+    const number=(selector,optional=false)=>{const raw=box.querySelector(selector).value.trim(); const x=Number(raw);if((!optional&&!raw)||!Number.isFinite(x)||x<0)throw new Error('수량·단가·종가를 올바르게 입력하세요');return x;};
+    const fills=p.lots.map((l,i)=>({lotId:l.id,qty:number(`[data-plan-qty="${i}"]`),price:number(`[data-plan-price="${i}"]`,true)}));
+    const request={planId:p.id,close:number('[data-plan-close]'),buyQty:number('[data-plan-buy]'),buyPrice:number('[data-plan-bp]',true),netting:box.querySelector('[data-plan-netting]').checked,fills};
+    if(!request.close||!Number.isInteger(request.buyQty)||(request.buyQty&&!request.buyPrice)||fills.some((f,i)=>!Number.isInteger(f.qty)||f.qty>p.lots[i].q||(f.qty&&!f.price)))throw new Error('종가·체결단가와 정수 수량을 확인하세요. 보유수량을 초과할 수 없습니다');
+    return request;
+  };
+  box.querySelector('[data-plan-suggest]').onclick=()=>{
+    const close=Number(box.querySelector('[data-plan-close]').value);if(!(close>0))return toast('해당 거래일 종가를 입력하세요');
+    p.lots.forEach((l,i)=>{box.querySelector(`[data-plan-qty="${i}"]`).value=l.held>=1&&(l.expired||cents(l.sp)<=cents(close))?l.q:0;box.querySelector(`[data-plan-price="${i}"]`).value=close;});
+    box.querySelector('[data-plan-buy]').value=close<=p.buyLimit?p.buyQty:0;box.querySelector('[data-plan-bp]').value=close;
+    box.querySelector('[data-plan-netting]').checked=true; box.querySelector('[data-plan-preview-box]').innerHTML='';
+    toast('저장 당시 조건으로 제안을 채웠습니다. 실제 체결과 대조하세요');
+  };
+  box.querySelector('[data-plan-preview]').onclick=()=>{
+    try{
+      const request=read(), sold=request.fills.reduce((n,f)=>n+f.qty,0), amount=request.fills.reduce((n,f)=>n+f.qty*f.price,0);
+      const preview=box.querySelector('[data-plan-preview-box]');
+      preview.innerHTML=`<div class="call hold"><b>${esc(p.date)} 정산 확인</b><br>매수 ${request.buyQty}주 / 매도 ${sold}주 · 순매매 ${request.buyQty-sold}주<br>매수금액 ${fUSD(request.buyQty*request.buyPrice)} / 매도금액 ${fUSD(amount)} (수수료 전)<br>${request.netting?'상계 수수료 절감 적용':'개별 실체결 수수료 적용'}<br>서버 원장에 반영하면 이 거래일은 재정산할 수 없습니다.</div><button class="btn" data-plan-commit>확인한 체결을 서버 원장에 반영</button>`;
+      preview.querySelector('[data-plan-commit]').onclick=()=>{
+        try{if(JSON.stringify(read())!==JSON.stringify(request)){preview.innerHTML='';throw new Error('입력이 바뀌었습니다. 미리보기를 다시 실행하세요');}}
+        catch(e){return toast(e.message);}
+        return planRun(async()=>{
+          await doPush(false,false);
+          let r;
+          try{r=await bridgePost({mode:'plansettle',ifmatch:S.cloudSavedAt,device:navigator.platform||'web'},JSON.stringify(request),async()=>{
+            const g=await hubGet(hubUrl({mode:'cfgget',_:Date.now()})); if(!g?.cfg?.data)return null;
+            const state=JSON.parse(g.cfg.data), receipt=state.planSettlements?.[k+':'+p.date];
+            return receipt?{ok:true,receipt,entry:g.cfg}:null;
+          });}catch(e){S.syncLinked=false;await persistLocalState();throw new Error('정산 결과 확인이 필요합니다. 설정에서 클라우드 받기 후 저장 주문표를 다시 조회하세요. '+e.message);}
+          if(!r?.ok||!r.entry?.data)throw new Error(r?.error||'정산 실패');
+          const creds={};CRED_FIELDS.forEach(f=>creds[f]=S[f]);
+          S=migrate(JSON.parse(r.entry.data));Object.assign(S,creds);S.cloudSavedAt=r.entry.at;S.syncLinked=true;
+          REC_MONTH_VIEW[k]=recordMonthKey(p.date);await persistLocalState();
+          await planRead(k,p.id);renderAll();toast(r.alreadySettled?'이미 정산된 내역을 불러왔습니다':'저장 주문표 기준으로 정산했습니다');
+        });
+      };
+    }catch(e){toast(e.message);}
+  };
+}
+async function fetchPrices(silent){
+  if(PLAN_BUSY)return;
+  if(PRICE_JOB)return PRICE_JOB;
+  PRICE_JOB=fetchPricesRaw(silent);
+  try{return await PRICE_JOB;}finally{PRICE_JOB=null;}
 }
 
 function engine(b){
@@ -823,9 +960,10 @@ function engine(b){
     const bq=num(r.buy), sq=num(r.sell), cl=num(r.close);
     const bpx=num(r.bp)>0? num(r.bp) : cl;                 // 실 매수단가 (없으면 종가)
     const spx=num(r.sp)>0? num(r.sp) : cl;                 // 실 매도단가 (없으면 종가)
-    E.bought += bq*bpx*(1+feeR);
-    E.sold   += sq*spx*(1-feeR);
-    const off = 2*feeR*cl*Math.min(bq,sq);                 // 상계 사다리 왕복수수료 절감
+    const recordFee=r.feeRate!=null?num(r.feeRate):feeR;
+    E.bought += bq*bpx*(1+recordFee);
+    E.sold   += sq*spx*(1-recordFee);
+    const off = r.feeSaved!=null?num(r.feeSaved):2*recordFee*cl*Math.min(bq,sq);                 // 상계 사다리 왕복수수료 절감
     E.feeSaved += off;
     E.qty    += bq - sq;
   });
@@ -934,36 +1072,6 @@ function engine(b){
 
   E.ladder = ladder(b,E);
   return E;
-}
-
-/* ── ⑧ 체결 정산 ────────────────────────────────────────
-   실제 종가를 넣으면 "원래 로직" 기준으로 원장·기록을 어떻게 정리할지 계산한다.
-   상계 사다리는 주문 방식일 뿐이고, 부기는 원래 로직을 따라야
-   목표수익률·보유기한이 전략 의도대로 다시 계산된다.
-
-   원래 로직:  종가 p 에서
-     · 매도 = 보유 1일 이상이면서 (기한도래 or 목표매도가 ≤ p) 인 로트 전량
-     · 매수 = p ≤ 매수지정가 이면 계획 수량 N
-     · 원장 = 매도된 로트 행 삭제 + 매수 체결 시 N주 신규 로트(종가·오늘 모드)
-   보유수량 증감은 N − S 로, 실제 상계 체결분과 정확히 일치한다. */
-function settle(b,E,close,dateISO){
-  const p=num(close), fee=num(b.fee);
-  const sells=E.lots.filter(l=> l.held>=1 && (l.expired || cents(l.sp)<=cents(p)))
-    .map(l=>({...l, planSell:num(l.q), actSell:num(l.q),
-              gain:(p*(1-fee)-num(l.p)*(1+fee))*num(l.q), loss:p*(1-fee)<num(l.p)*(1+fee)}));
-  const S=sells.reduce((s,l)=>s+num(l.q),0);
-  const buyFills = E.buyQty>0 && StrategyCore.isBuyFilled(p, E.buyLimit);
-  const N = buyFills? E.buyQty : 0;
-
-  // 매도일 매수금지 규칙을 실제 종가로 재판정 (계획 시점 예측과 다를 수 있음)
-  const rule=num(b.sellDayBuyRule), lossN=sells.filter(l=>l.loss).length;
-  const allowNow = rule===0 ? true : (sells.length===0 ? true : (rule===1 ? lossN>0 : lossN===sells.length));
-
-  return {p, d:dateISO, sells, S, N, buyFills, net:N-S, mode:E.mode,
-          proceeds:S*p, cost:N*p, cash:(S-N)*p,
-          realized:sells.reduce((s,l)=>s+l.gain,0),
-          ruleFlip: allowNow!==E.allowBuy, allowNow,
-          keepLots:(b.lots||[]).length - sells.length + (N>0?1:0)};
 }
 
 /* ── ⑦ 상계 사다리 ─────────────────────────────────────────
@@ -1507,21 +1615,7 @@ function renderBook(k){
     </div>
   </div>
 
-  <!-- ⑧ 체결 정산 -->
-  <div class="sec">
-    <div class="sec-h"><span class="n">⑧</span><h2>체결 정산</h2><span class="hint">장 마감 후 원장 정리</span></div>
-    <div class="card">
-      <div class="fgrid c3">
-        <label class="f"><span class="l">체결 종가 ($)</span><input id="st-p-${k}" value="${E.prevClose||''}"></label>
-        <label class="f"><span class="l">거래일</span><input type="date" id="st-d-${k}" value="${E.session}"></label>
-        <label class="f"><span class="l">&nbsp;</span><button class="btn" data-stcalc="${k}" style="width:100%">정산 미리보기</button></label>
-      </div>
-      <div id="st-out-${k}"></div>
-      <div class="note">주문은 ⑦ 상계 사다리로 내되, <b>원장 부기는 원래 로직</b>을 따릅니다.
-        목표가에 도달한 로트는 삭제하고, 매수가 체결됐으면 계획 수량 전량을 종가로 신규 로트에 넣습니다.
-        보유수량 증감(N−S)은 실제 상계 체결분과 정확히 일치하므로 예수금·손익이 어긋나지 않습니다.</div>
-    </div>
-  </div>
+  ${planPanel(k)}
 
   <!-- ⑥ 일별 매매 기록 -->
   <div class="sec">
@@ -1640,6 +1734,7 @@ function renderBook(k){
             <button class="toggle ${b.vxnForceSafe?'on':''}" data-tb="${k}:vxnForceSafe"></button></div>
         </div>
       </div>
+      ${renderVxnReview(b,k)}
       <label class="f" style="margin-top:14px"><span class="l">VXN 일별 종가 — 「날짜 값」 한 줄에 하나 (시세 갱신 시 자동 채워짐)</span>
         <textarea id="vx-${k}" placeholder="2026-07-22\t21.40&#10;2026-07-23\t22.10">${(b.vxnSeries||[]).slice(-120).map(w=>w.d+'\t'+w.c).join('\n')}</textarea></label>
       <div class="btnrow"><button class="btn sm" data-vx="${k}">VXN 반영</button>
@@ -1704,8 +1799,40 @@ function recRows(k,b,month){
   return rows.reverse().join('');
 }
 
+function renderVxnReview(b,k){
+  const all=(b.vxnSeries||[]).filter(x=>x.d && num(x.c)>0).sort((a,b)=>a.d.localeCompare(b.d));
+  const pending=all.filter(x=>x.status==='pending').length;
+  const rows=all.filter((x,i)=>i>=all.length-60 || x.status==='pending').reverse();
+  return `<details style="margin-top:14px" ${pending?'open':''}><summary>VXN 원천 확인 · 미확인 ${pending}건</summary>
+    <div class="note">빨간 값은 Yahoo 보충값입니다. 미확인 값도 계산에 사용합니다. <a href="https://kr.investing.com/indices/cboe-nasdaq-100-voltility-historical-data" target="_blank" rel="noopener noreferrer">Investing.com에서 직접 확인</a>한 뒤, 값이 같으면 그대로 저장하고 다르면 수정해서 저장하세요. 사용자 확인값은 자동 갱신으로 덮어쓰지 않습니다.</div>
+    <div style="max-height:340px;overflow:auto"><table><thead><tr><th>날짜</th><th>VXN</th><th>상태</th><th>확인</th></tr></thead><tbody>${rows.map(x=>`<tr>
+    <td>${esc(x.d)}</td><td><input data-vxn-value="${esc(x.d)}" value="${num(x.c)}" type="number" min="0.01" step="0.01" style="width:90px;${x.status==='pending'?'color:#ff5757;border:1px solid #ff5757;':''}"></td>
+    <td style="${x.status==='pending'?'color:#ff5757':''}">${x.status==='manual'?'사용자 확인':x.source==='cboe'?'Cboe':x.source==='yahoo'?'Yahoo · 미확인':'출처 미확인'}</td>
+    <td><button class="btn sm" data-vxn-review="${esc(x.d)}" ${x.revision?'':'disabled'}>확인·저장</button></td></tr>`).join('')}</tbody></table></div>
+    <div class="note">확인 버튼이 비활성화된 행은 시세 갱신 후 다시 확인하세요. 최근 60개 행과 모든 미확인 행을 표시합니다.</div></details>`;
+}
+async function confirmVxnRow(k,date,button){
+  const root=$('#p-'+k.toLowerCase()),input=root.querySelector('[data-vxn-value="'+date+'"]');
+  const row=(S.books[k].vxnSeries||[]).find(x=>x.d===date),value=Number(input.value);
+  if(!row || !row.revision || !Number.isFinite(value) || value<=0) return toast('유효한 VXN 값과 최신 시세가 필요합니다');
+  if(!S.gsUrl) return toast('구글시트 연결을 먼저 설정하세요');
+  button.disabled=true;
+  try{
+    const j=await bridgePost({mode:'vxnreview'},JSON.stringify({date,value,revision:row.revision}),async()=>{
+      const result=await hubGet(hubUrl({mode:'vxnreviewget'})),entry=result.entries && result.entries[date];
+      return result.ok && entry && entry.status==='manual' && entry.c===value && entry.revision!==row.revision ? {ok:true,entry}:null;
+    });
+    if(!j.ok || !j.entry) throw new Error(j.error||'확인값 저장 실패');
+    bookKeys().forEach(bk=>{S.books[bk].vxnSeries=(S.books[bk].vxnSeries||[]).map(x=>x.d===date?{...x,...j.entry}:x);});
+    await save();renderAll();toast(date+' VXN 확인·저장 완료');
+  }catch(e){toast(e.message||'저장 실패');}
+  finally{button.disabled=false;}
+}
+
 function bindBook(k){
+  // VXN 확인 버튼은 아래 root 바인딩 후 연결한다.
   const b=S.books[k], root=$('#p-'+k.toLowerCase());
+  $$('[data-vxn-review]',root).forEach(el=>el.onclick=()=>confirmVxnRow(k,el.dataset.vxnReview,el));
   $$('[data-b]',root).forEach(el=> el.onchange=()=>{
     const [bk,f]=el.dataset.b.split(':');
     const v = el.tagName==='SELECT' ? (f==='sellDayBuyRule'? num(el.value): el.value) : num(el.value);
@@ -1735,7 +1862,8 @@ function bindBook(k){
       const d=m[0].replace(/[./]/g,'-'), c=num(m[1]); if(!/^\d{4}-\d{1,2}-\d{1,2}$/.test(d)||!c) return;
       const [y,mo,da]=d.split('-'); out.push({d:`${y}-${mo.padStart(2,'0')}-${da.padStart(2,'0')}`, c});
     });
-    S.books[k].vxnSeries = out.sort((a,c)=> a.d<c.d?-1:1); touch(); renderBook(k);
+    const meta=Object.fromEntries((S.books[k].vxnSeries||[]).map(x=>[x.d,x]));
+    S.books[k].vxnSeries = out.map(x=>({...meta[x.d],...x,...(meta[x.d] && num(meta[x.d].c)!==x.c?{status:'pending',source:'local'}:{})})).sort((a,c)=> a.d<c.d?-1:1); touch(); renderBook(k);
     toast(out.length+'일 반영'); });
   $$('[data-wk]',root).forEach(el=> el.onclick=()=>{
     const txt=$('#wk-'+k).value, out=[];
@@ -1746,89 +1874,9 @@ function bindBook(k){
     });
     S.books[k].weekly = out.sort((a,c)=> a.d<c.d?-1:1); touch(); renderBook(k);
     toast(out.length+'주 반영 · 모드 재판정'); });
-  $$('[data-stcalc]',root).forEach(el=> el.onclick=()=>{
-    const p=num($('#st-p-'+k).value), d=$('#st-d-'+k).value||todayISO();
-    const box=$('#st-out-'+k);
-    if(!(p>0)) return box.innerHTML=`<div class="call warn" style="margin-top:12px">체결 종가를 입력하세요</div>`;
-    const r=settle(b, engine(b), p, d);
-    const dup=(b.records||[]).some(x=>x.d===d && !x.auto);
-    box.innerHTML = `
-      <div class="grid g2" style="margin-top:14px">
-        <div class="call ${r.N>0?'buy':'hold'}"><div class="hd">매수</div>
-          ${r.buyFills? `<b>${r.N}주</b> 체결 · ${fUSD(r.cost)}<br><span style="opacity:.8">종가 ${fUSD(p)} ≤ 지정가 ${fUSD(engine(b).buyLimit)}</span>`
-                      : `미체결 — 종가 ${fUSD(p)} > 지정가 ${fUSD(engine(b).buyLimit)}`}</div>
-        <div class="call ${r.S>0?'sell':'hold'}"><div class="hd">매도</div>
-          ${r.S>0? `<b>${r.S}주</b> 체결 · ${fUSD(r.proceeds)}<br><span style="opacity:.8">실현손익 ${fUSD(r.realized)}</span>`
-                 : '해당 로트 없음'}</div>
-      </div>
-      <div class="dl" style="margin-top:12px">
-        <dt>실제 순매매</dt><dd class="${r.net>0?'up':r.net<0?'down':''}">${r.net>0?'+':''}${r.net}주 · 현금 ${r.cash>=0?'+':''}${fUSD(r.cash)}</dd>
-        <dt>정리 후 로트</dt><dd>${(b.lots||[]).length}개 → ${r.keepLots}개</dd>
-      </div>
-      ${r.sells.length? `<div class="tw" style="margin-top:12px"><table style="min-width:520px">
-        <thead><tr><th>삭제할 로트</th><th>수량</th><th>매수가</th><th>사유</th><th>손익</th></tr></thead>
-        <tbody>${r.sells.map(l=>`<tr><td class="nm">#${l.i+1} <span style="color:var(--tx3);font-weight:400">${esc(l.d)}</span></td>
-          <td style="color:var(--red)">−${l.q}주</td><td>${fUSD(num(l.p))}</td>
-          <td style="text-align:left;font-size:12px">${l.expired?'기한 도래':'목표가 도달'}</td>
-          <td class="${l.loss?'down':'up'}">${fUSD(l.gain)}</td></tr>`).join('')}</tbody></table></div>`:''}
-      ${r.N>0? `<div class="call buy" style="margin-top:12px"><div class="hd">추가할 로트</div>
-        ${d} · <b>${r.N}주</b> @ ${fUSD(p)} · ${r.mode} 모드 · 목표 ${fUSD(p*(1+(r.mode==='안전'?b.safeTarget:b.aggrTarget)+(2+(r.mode==='안전'?b.safeTarget:b.aggrTarget))*b.fee))}</div>`:''}
-      ${r.ruleFlip? `<div class="call warn" style="margin-top:12px"><div class="hd">주의 — 매수금지 규칙 재판정</div>
-        실제 종가 기준으로는 매수가 <b>${r.allowNow?'허용':'금지'}</b>입니다. 주문은 전일 종가 기준으로 이미 냈으므로
-        계획 수량대로 반영합니다. 규칙을 엄격히 적용하려면 매수 부분을 수동으로 조정하세요.</div>`:''}
-      ${dup? `<div class="call warn" style="margin-top:12px">${d} 기록이 이미 있습니다. 반영하면 <b>덮어씁니다.</b></div>`:''}
-      <div class="card" style="margin-top:12px;background:var(--bg2,rgba(128,128,128,.06))">
-        <div class="hd" style="font-weight:600;margin-bottom:8px">실제 체결 입력 <span class="hint">제안과 다르게 체결됐으면 수정 — 원장은 실제 값으로 기록됩니다</span></div>
-        ${r.sells.length? `<table style="width:100%;font-size:12.5px"><tr><th style="text-align:left">매도 로트</th><th>계획</th><th>실제 수량</th></tr>
-          ${r.sells.map((l,si)=>`<tr><td>${l.d} · ${fUSD(num(l.p))}</td><td style="text-align:center">${l.planSell}</td>
-            <td style="text-align:center"><input data-stsq="${si}" value="${l.planSell}" inputmode="numeric" style="width:72px;text-align:center"></td></tr>`).join('')}
-          </table>
-          <div style="margin-top:6px"><label class="f" style="display:inline-flex;gap:6px;align-items:center"><span class="l">평균 매도단가 ($)</span>
-            <input id="st-sp-${k}" value="${r.p}" style="width:110px"></label></div>`
-        : '<div class="hint">오늘 매도 없음</div>'}
-        <div style="margin-top:10px;display:flex;gap:12px;flex-wrap:wrap">
-          <label class="f"><span class="l">실제 매수 수량</span><input id="st-bn-${k}" value="${r.N}" inputmode="numeric" style="width:90px"></label>
-          <label class="f"><span class="l">실제 매수단가 ($)</span><input id="st-bp-${k}" value="${r.p}" style="width:110px"></label>
-        </div>
-      </div>
-      <div class="btnrow"><button class="btn" data-stapply="${k}">원장·기록에 반영</button>
-        <button class="btn g" data-stclear="${k}">닫기</button></div>`;
-    box._r=r;
-    $$('[data-stapply]',box).forEach(x=> x.onclick=()=>{
-      const rr=box._r; const bb=S.books[k];
-      // 실제 체결 값 수집
-      const acts = rr.sells.map((l,si)=>{
-        const el=box.querySelector(`[data-stsq="${si}"]`);
-        const v=Math.max(0, Math.min(num(l.q), Math.floor(num(el? el.value : l.planSell))));
-        return {i:l.i, act:v, plan:l.planSell};
-      });
-      const actS = acts.reduce((s,a)=>s+a.act,0);
-      const actN = Math.max(0, Math.floor(num(($('#st-bn-'+k)||{}).value ?? rr.N)));
-      const bpIn = num(($('#st-bp-'+k)||{}).value); const bp = bpIn>0? bpIn : rr.p;
-      const spIn = num(($('#st-sp-'+k)||{}).value); const sp = spIn>0? spIn : rr.p;
-      const manual = actS!==rr.S || actN!==rr.N || cents(bp)!==cents(rr.p) || (rr.S>0 && cents(sp)!==cents(rr.p));
-      // 부분매도: 잔량 차감, 0이 되면 삭제 (계약 유지)
-      const dec=new Map(acts.map(a=>[a.i,a.act]));
-      bb.lots=(bb.lots||[]).map((l,i)=>{
-        if(!dec.has(i)) return l;
-        const rem=num(l.q)-dec.get(i);
-        return rem>0 ? Object.assign({},l,{q:rem}) : null;
-      }).filter(Boolean);
-      if(actN>0) bb.lots.push(stampNewLot(bb,{d:rr.d, p:bp, q:actN, mode:rr.mode}));
-      bb.records=(bb.records||[]).filter(x=>x.d!==rr.d);
-      const rec={d:rr.d, close:rr.p, buy:actN, sell:actS};
-      if(actN>0 && cents(bp)!==cents(rr.p)) rec.bp=bp;
-      if(actS>0 && cents(sp)!==cents(rr.p)) rec.sp=sp;
-      if(manual) rec.man=1;
-      bb.records.push(rec);
-      bb.records.sort((a,c)=> a.d<c.d?-1:1);
-      REC_MONTH_VIEW[k]=recordMonthKey(rr.d);
-      touch(); renderBook(k);
-      auditNote(k, 'settle', `${rr.d} 매수 ${actN}(계획 ${rr.N}) 매도 ${actS}(계획 ${rr.S})${manual?' · 수동수정':''}`);
-      toast(`정산 완료 · 매수 ${actN}주 / 매도 ${actS}주 반영${manual?' (수동 수정됨)':''}`);
-    });
-    $$('[data-stclear]',box).forEach(x=> x.onclick=()=>{ box.innerHTML=''; });
-  });
+  $$('[data-plan-save]',root).forEach(el=>el.onclick=()=>saveOrderPlan(k));
+  $$('[data-plan-list]',root).forEach(el=>el.onclick=()=>planRun(async()=>{await planRead(k);renderPlanView(k);}));
+  renderPlanView(k);
   const monthInput=$('#rm-'+k);
   if(monthInput) monthInput.onchange=()=>{
     if(/^\d{4}-\d{2}$/.test(monthInput.value||'')) REC_MONTH_VIEW[k]=monthInput.value;
@@ -1848,6 +1896,7 @@ function bindBook(k){
   $$('[data-radd]',root).forEach(el=> el.onclick=()=>{
     const d=$('#rd-'+k).value, c=num($('#rc-'+k).value);
     if(!d||!c) return toast('날짜와 종가를 입력하세요');
+    if((S.books[k].records||[]).some(r=>r.d===d&&r.planId))return toast('저장 주문표로 정산한 기록은 여기서 변경할 수 없습니다');
     const existed=(S.books[k].records||[]).some(r=>r.d===d);
     S.books[k].records = (S.books[k].records||[]).filter(r=>r.d!==d);
     S.books[k].records.push({d, close:c, buy:num($('#rb-'+k).value), sell:num($('#rs-'+k).value)});
@@ -1858,6 +1907,7 @@ function bindBook(k){
     touch(); renderBook(k); toast(existed?'기록을 수정했습니다':'기록을 추가했습니다'); });
   $$('[data-rdel]',root).forEach(el=> el.onclick=()=>{
     const [bk,d]=el.dataset.rdel.split(':');
+    if(S.books[bk].records.some(r=>r.d===d&&r.planId))return toast('정산 기록은 삭제할 수 없습니다');
     S.books[bk].records=S.books[bk].records.filter(r=>r.d!==d); touch(); renderBook(bk); });
 }
 
@@ -2288,7 +2338,7 @@ function applyQuote(j,src){
   }
   // VXN 시계열 반영
   if(j.series && Array.isArray(j.series.VXN) && j.series.VXN.length){
-    const vs=j.series.VXN.map(r=>({d:String(r[0]).slice(0,10), c:+r[1]})).filter(x=>x.c>0);
+    const vs=j.series.VXN.map(r=>({...(j.vxnMeta && j.vxnMeta[String(r[0]).slice(0,10)] || {}),d:String(r[0]).slice(0,10), c:+r[1]})).filter(x=>x.c>0);
     bookKeys().forEach(k=>{ S.books[k].vxnSeries=vs.slice(-400); });
   }
   if(!Object.keys(QUOTE).length) throw new Error(
@@ -2422,10 +2472,10 @@ async function bridgePost(params, payloadText, verifyAfterOpaqueFailure){
 }
 let pushTimer=null, lastPushErr='', pushQueue=Promise.resolve();
 function cloudPush(){                      // save() 에서 자동 호출 (디바운스)
-  if(!syncReady()) return;
+  if(!syncReady() || PLAN_BUSY) return;
   if(!S.syncLinked) return;                // 최초 받기/올리기 전에는 자동 업로드 금지
   clearTimeout(pushTimer);
-  pushTimer=setTimeout(()=> doPush(false,true), 1200);
+  pushTimer=setTimeout(()=>{pushTimer=null;doPush(false,true);},1200);
 }
 function doPush(force,silent){
   const task=()=>doPushNow(force,silent);
@@ -2628,7 +2678,7 @@ async function hubCollectAll(ids, prog){
   return {done, fail};
 }
 
-async function fetchPrices(silent){
+async function fetchPricesRaw(silent){
   const btn=$('#fetchPx'), out=$('#diag');
   if(btn){ btn.disabled=true; btn.textContent='조회 중…'; }
   const fin=()=>{ if(btn){ btn.disabled=false; btn.textContent='지금 갱신'; } };
@@ -2688,7 +2738,7 @@ async function fetchPrices(silent){
       const td=await tdQuote();
       const combined={fx:td.fx || (hubData && hubData.fx),
         prices:Object.assign({},hubData && hubData.prices,td.prices),
-        series:Object.assign({},hubData && hubData.series,td.series)};
+        series:Object.assign({},hubData && hubData.series,td.series),vxnMeta:hubData && hubData.vxnMeta};
       const remaining=accept(combined,'Twelve Data');
       if(!remaining.length) return await ok('Twelve Data','성공 (EOD 확정 종가)',added);
       log+=diagLine(false,'Twelve Data','미수신: '+remaining.join(', '));
@@ -2889,7 +2939,7 @@ async function unlockPrompt(){
   /* 다른 기기에서 수정한 내용 자동 반영:
      탭이 다시 활성화되면 저장소 최신본을 다시 읽어온다 */
   document.addEventListener('visibilitychange', async ()=>{
-    if(document.visibilityState!=='visible' || !window.storage) return;
+    if(PLAN_BUSY || document.visibilityState!=='visible' || !window.storage) return;
     try{
       const fresh=await Store.get();
       if(fresh && JSON.stringify(fresh)!==JSON.stringify(S)){
